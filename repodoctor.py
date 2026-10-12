@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """repodoctor: read a repo's setup requirements from its code and check them against this machine."""
 import argparse
+import ast
 import json
 import os
 import re
@@ -8,6 +9,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 
 OK, FAIL, WARN = "ok", "fail", "warn"
@@ -22,16 +24,17 @@ JS_EXT = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
 AMBIENT = {"NODE_ENV", "PATH", "HOME", "USER", "PWD", "SHELL", "TERM", "LANG", "TZ", "EDITOR", "CI",
            "TMPDIR", "TEMP", "TMP", "APPDATA", "LOCALAPPDATA", "USERPROFILE", "HOSTNAME", "HOST", "PORT",
            "DEBUG", "PYTHONPATH", "VIRTUAL_ENV", "NO_COLOR", "FORCE_COLOR", "VERCEL", "NETLIFY",
-           "MODE", "DEV", "PROD", "SSR", "BASE_URL"}
+           "MODE", "DEV", "PROD", "SSR", "BASE_URL", "PROGRAMFILES", "SYSTEMROOT", "WINDIR", "COMSPEC", "OS"}
 AMBIENT_PREFIX = ("npm_", "GITHUB_", "VERCEL_", "XDG_", "RUNNER_")
 
-# The trailing group marks a use that copes with the variable being unset: a fallback, a ternary or
-# && test, or an assignment.
+# A read is "hard" when the code breaks without the variable: an unconditional os.environ["X"], or
+# TypeScript's process.env.X! assertion. It is "optional" when the code copes: a fallback, a ternary
+# or && test, or an assignment. Everything else (os.getenv("X"), a bare process.env.X, any read inside
+# an if or try) is treated as a setting the app can run without, because on real repos that is what
+# it nearly always is.
 JS_ENV = re.compile(r"""(?:process\.env|import\.meta\.env)(?:\.([A-Z][A-Z0-9_]*)|\[\s*['"](\w+)['"]\s*\])"""
-                    r"""(\s*(?:\|\||\?|&&|=(?!=)))?""")
+                    r"""(!(?!=))?(\s*(?:\|\||\?|&&|=(?!=)))?""")
 JS_DESTRUCT = re.compile(r"\{([^}]*)\}\s*=\s*process\.env\b(?!\s*[.\[])")
-PY_INDEX = re.compile(r"""\benviron\[\s*['"](\w+)['"]\s*\](\s*=(?!=))?""")
-PY_GET = re.compile(r"""\b(?:environ\.get|getenv)\(\s*['"](\w+)['"]\s*(,|\)\s*or\b)?""")
 
 ENV_FILES = [".env", ".env.local", ".env.development", ".env.development.local"]
 ENV_EXAMPLES = [".env.example", ".env.sample", ".env.template", ".env.dist"]
@@ -42,11 +45,6 @@ INSTALL = {"pnpm": "npm install -g pnpm", "yarn": "npm install -g yarn", "bun": 
            "uv": "pip install uv", "poetry": "pipx install poetry", "pipenv": "pip install pipenv"}
 
 SERVICES = {5432: "Postgres", 6379: "Redis", 27017: "MongoDB", 3306: "MySQL"}
-NODE_DRIVERS = {"pg": 5432, "postgres": 5432, "redis": 6379, "ioredis": 6379, "mongodb": 27017,
-                "mongoose": 27017, "mysql": 3306, "mysql2": 3306}
-PY_DRIVERS = {"psycopg2-binary": 5432, "psycopg2": 5432, "psycopg": 5432, "asyncpg": 5432, "redis": 6379,
-              "pymongo": 27017, "motor": 27017, "mysqlclient": 3306, "pymysql": 3306}
-PY_DRIVER = re.compile(r"""(?mi)(?:^|["'])\s*(%s)\s*(?=$|[\["'<>=~!;,\s])""" % "|".join(PY_DRIVERS))
 # ponytail: pattern match, not a YAML parser; misses ports written as ${VAR:-5432}:5432. Parse YAML if that bites.
 COMPOSE_PORT = re.compile(r"""(?m)^\s*-\s*["']?(?:[\d.]+:)?(\d+):(\d+)(?:/tcp)?["']?\s*$""")
 
@@ -121,25 +119,58 @@ def port_open(port):
         return False
 
 
-def env_uses(line, is_js):
-    """Yield (name, optional) for each env var read on this line."""
-    if is_js:
+def js_env_uses(text):
+    """Yield (name, line number, optional, hard) for each env var a JS/TS file reads."""
+    for n, line in enumerate(text.splitlines(), 1):
+        # long lines are minified or generated code
+        if "env" not in line or len(line) > 2000 or line.lstrip().startswith(("//", "*")):
+            continue
         for m in JS_ENV.finditer(line):
-            yield m.group(1) or m.group(2), bool(m.group(3))
+            yield m.group(1) or m.group(2), n, bool(m.group(4)), bool(m.group(3))
         for m in JS_DESTRUCT.finditer(line):
             for item in m.group(1).split(","):
                 name = re.match(r"\s*(\w+)", item)
                 if name:
-                    yield name.group(1), "=" in item
-    else:
-        for rx in (PY_INDEX, PY_GET):
-            for m in rx.finditer(line):
-                yield m.group(1), bool(m.group(2))
+                    yield name.group(1), n, "=" in item, False
+
+
+def py_env_uses(text):
+    """Return (name, line number, optional, hard) for each env var a Python file reads."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return []  # a template, or syntax this Python can't read: nothing can be said safely
+
+    def is_environ(node):
+        return (isinstance(node, ast.Attribute) and node.attr == "environ") or \
+               (isinstance(node, ast.Name) and node.id == "environ")
+
+    def text_of(node):
+        return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+    uses, stack = [], [(tree, False, False)]
+    while stack:
+        node, guarded, in_or = stack.pop()
+        if isinstance(node, ast.Subscript) and is_environ(node.value) and text_of(node.slice) \
+                and isinstance(node.ctx, ast.Load):
+            uses.append((text_of(node.slice), node.lineno, False, not guarded))
+        elif isinstance(node, ast.Call) and node.args and text_of(node.args[0]):
+            f = node.func
+            if (isinstance(f, ast.Name) and f.id == "getenv") or (isinstance(f, ast.Attribute) and (
+                    f.attr == "getenv" or (f.attr == "get" and is_environ(f.value)))):
+                has_default = len(node.args) > 1 or bool(node.keywords) or in_or
+                uses.append((text_of(node.args[0]), node.lineno, has_default, False))
+        guarded = guarded or isinstance(node, (ast.If, ast.IfExp, ast.Try))
+        is_or = isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or)
+        stack.extend((child, guarded, is_or) for child in ast.iter_child_nodes(node))
+    return sorted(uses, key=lambda use: use[1])
 
 
 def scan_env(root):
-    """Map each env var the source reads without a fallback to the 'file:line' of its first use."""
-    required = {}
+    """Map each env var the source reads without a fallback to ('file:line' of first use, hard)."""
+    reads = {}
     for dirpath, dirs, files in os.walk(root):
         dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith("."))
         for name in sorted(files):
@@ -152,13 +183,15 @@ def scan_env(root):
                     continue
             except OSError:
                 continue
-            for n, line in enumerate(read(path).splitlines(), 1):
-                if "env" not in line or line.lstrip().startswith(("//", "#", "*")):
+            text = read(path)
+            if "env" not in text:
+                continue
+            for var, n, optional, hard in (py_env_uses if ext == ".py" else js_env_uses)(text):
+                if optional or var in AMBIENT or var.startswith(AMBIENT_PREFIX):
                     continue
-                for var, optional in env_uses(line, ext in JS_EXT):
-                    if not optional and var not in AMBIENT and not var.startswith(AMBIENT_PREFIX):
-                        required.setdefault(var, f"{path.relative_to(root).as_posix()}:{n}")
-    return required
+                if var not in reads or (hard and not reads[var][1]):
+                    reads[var] = (f"{path.relative_to(root).as_posix()}:{n}", hard)
+    return reads
 
 
 def env_keys(root, names, commented=False):
@@ -185,17 +218,17 @@ def diagnose(root, ci=False, env=os.environ):
     def add(*check):
         checks.append(check)
 
-    required = scan_env(root)
+    reads = scan_env(root)
     example = next((n for n in ENV_EXAMPLES if (root / n).exists()), None)
     documented = env_keys(root, ENV_EXAMPLES, commented=True)
-    undocumented = sorted(v for v in required if v not in documented)
+    undocumented = sorted(v for v in reads if v not in documented)
 
     if ci:
         for var in undocumented:
-            add(FAIL, f"{var} is read at {required[var]} but is not in {example or '.env.example'}",
+            add(FAIL, f"{var} is read at {reads[var][0]} but is not in {example or '.env.example'}",
                 f"add {var}= to {example or '.env.example'}")
-        if required and not undocumented:
-            add(OK, f"All {len(required)} environment variables are documented in {example}", None)
+        if reads and not undocumented:
+            add(OK, f"All {len(reads)} environment variables are documented in {example}", None)
         return checks
 
     try:
@@ -258,6 +291,7 @@ def diagnose(root, ci=False, env=os.environ):
                 install)
 
     set_keys = env_keys(root, ENV_FILES)
+    required = [v for v, (_, hard) in reads.items() if hard]
     missing = sorted(v for v in required if v not in env and v not in set_keys)
     if required and not missing:
         add(OK, f"All {len(required)} required environment variables are set", None)
@@ -271,14 +305,12 @@ def diagnose(root, ci=False, env=os.environ):
         add(WARN, f"In {example} but not in your .env: " + ", ".join(sorted(set(declared_unset) - set(missing))),
             f"copy them over from {example} if you need them")
     for var in missing:
-        add(FAIL, f"{var} is not set (first used in {required[var]})", f"add {var}=... to .env")
-    if undocumented and not example:
-        add(WARN, f"No .env.example file; {len(undocumented)} variable(s) the code reads are undocumented",
-            "create .env.example listing: " + ", ".join(undocumented))
-    else:
-        for var in undocumented:
-            add(WARN, f"{var} is used in code ({required[var]}) but missing from {example}",
-                f"add {var}= to {example}")
+        add(FAIL, f"{var} is not set (first used in {reads[var][0]})", f"add {var}=... to .env")
+    # Only worth a line when the repo keeps an example file and it has fallen behind the code.
+    if undocumented and example:
+        shown = ", ".join(undocumented[:5]) + (f" and {len(undocumented) - 5} more" if len(undocumented) > 5 else "")
+        add(WARN, f"{len(undocumented)} variable(s) the code reads are missing from {example}: {shown}",
+            "repodoctor --ci lists each one with its location")
 
     declared = {}
     compose = next((n for n in ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml")
@@ -294,22 +326,6 @@ def diagnose(root, ci=False, env=os.environ):
         else:
             add(FAIL, f"{service} ({compose}) is not reachable on localhost:{port}",
                 "docker compose up -d" if on_path("docker") else "install Docker, then: docker compose up -d")
-    drivers = {}
-    for dep in list(pkg.get("dependencies") or {}) + list(pkg.get("devDependencies") or {}):
-        if dep in NODE_DRIVERS:
-            drivers.setdefault(NODE_DRIVERS[dep], dep)
-    for text in (read(root / "requirements.txt"), pyproject, read(root / "Pipfile")):
-        for dep in PY_DRIVER.findall(text):
-            drivers.setdefault(PY_DRIVERS[dep.lower()], dep)
-    for port, dep in sorted(drivers.items()):
-        service = SERVICES[port]
-        if service in declared.values():
-            continue
-        if port_open(port):
-            add(OK, f"{service} reachable on localhost:{port}", None)
-        else:  # a warning, not a failure: the database may be remote
-            add(WARN, f"{dep} is a dependency, but no {service} is listening on localhost:{port}",
-                f"start {service} locally, or ignore this if yours is remote")
     return checks
 
 

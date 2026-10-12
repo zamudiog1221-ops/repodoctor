@@ -49,11 +49,17 @@ The exit code is 1 if any check failed. It only reports; it never changes anythi
 | Python version | `.python-version`, `runtime.txt`, `pyproject.toml` |
 | Package manager is installed | lockfile or `packageManager` (pnpm, yarn, bun, uv, poetry, pipenv) |
 | Dependencies are installed | `node_modules`; `.venv` or `venv` |
-| Env vars are set | every `process.env.X`, `import.meta.env.X`, `os.environ[...]`, `os.getenv(...)` in the source, plus `.env.example` |
-| Env vars are documented | the same scan, compared with `.env.example` |
-| Services are running | Postgres, Redis, MongoDB and MySQL ports in the compose file, or their drivers in the dependencies |
+| Env vars are set | `.env.example`, plus reads in the source that break when the variable is unset |
+| Env vars are documented | every env var the source reads, compared with `.env.example` |
+| Services are running | Postgres, Redis, MongoDB and MySQL ports in the compose file |
 
-A variable read with a fallback (`os.getenv("X", "default")`, `process.env.X || ...`) counts as optional and is not reported. Tests, docs, examples and installed packages are not scanned.
+It only fails a check when the repo declares the requirement. For environment variables that means one of:
+
+- the variable is in `.env.example` and you have no `.env`
+- Python reads it as `os.environ["X"]` outside any `if` or `try`
+- TypeScript reads it as `process.env.X!`
+
+Softer reads such as `os.getenv("X")` or a bare `process.env.X` are treated as settings the app can run without. On real projects they nearly always are, and reporting them buried the real problems under dozens of false alarms. Tests, docs, examples and installed packages are not scanned.
 
 ## CI mode
 
@@ -64,6 +70,8 @@ A variable read with a fallback (`os.getenv("X", "default")`, `process.env.X || 
 - Node and Python only.
 - It checks the folder you point it at. In a monorepo, run it in each project folder.
 - Env var names built at runtime, or read through a settings library (Joi, pydantic-settings, django-environ), are not seen by the scan. The `.env.example` check still covers them.
+- A JavaScript project with no `.env.example` gets no env var checks, because nothing in plain JavaScript marks a variable as required.
+- A database is only checked if the compose file publishes its port. One you are expected to install yourself is not detected.
 - Compose files are read by pattern, so ports written as `${VAR:-5432}:5432` are missed.
 - A missing Python virtualenv is a warning, because poetry and pipenv keep theirs outside the repo.
 - Anything that lives outside the code, such as VPN access or an account someone has to create for you, cannot be detected.

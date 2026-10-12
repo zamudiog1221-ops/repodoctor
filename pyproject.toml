@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,8 +7,8 @@ name = "repodoctor"
 version = "0.1.0"
 description = "Read a repo's setup requirements from its code and check them against your machine."
 readme = "README.md"
-requires-python = ">=3.8"
-license = {text = "MIT"}
+requires-python = ">=3.9"
+license = "MIT"
 
 [project.scripts]
 repodoctor = "repodoctor:main"
