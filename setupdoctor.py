@@ -16,6 +16,7 @@ import re  # noqa: E402
 import shutil  # noqa: E402
 import socket  # noqa: E402
 import subprocess  # noqa: E402
+import time  # noqa: E402
 import warnings  # noqa: E402
 from pathlib import Path  # noqa: E402
 
@@ -164,6 +165,24 @@ def port_open(port):
         return False
 
 
+def wait_for_port(port, seconds):
+    """port_open, retried for up to `seconds`: a container that just started takes a moment to listen."""
+    deadline = time.monotonic() + seconds
+    while not port_open(port):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(1)
+    return True
+
+
+def docker_running():
+    """True if the Docker engine answers. Docker being installed doesn't mean it has been started."""
+    try:
+        return subprocess.run([which("docker"), "info"], capture_output=True, timeout=20).returncode == 0
+    except (OSError, TypeError, subprocess.SubprocessError):
+        return False
+
+
 def js_env_uses(text):
     """Yield (name, line number, optional, hard) for each env var a JS/TS file reads."""
     for n, line in enumerate(text.splitlines(), 1):
@@ -255,7 +274,7 @@ def check_version(label, found, spec, source, n, fix):
     return FAIL, f"{need}, found {shown}", fix
 
 
-def diagnose(root, ci=False, env=os.environ):
+def diagnose(root, ci=False, env=os.environ, port_wait=0):
     """Return a list of (status, message, fix, run) for the repo at `root`.
     `fix` is the text shown to the user; `run` is the list of commands setupdoctor can run to do it,
     or None when it has to be done by hand."""
@@ -393,14 +412,15 @@ def diagnose(root, ci=False, env=os.environ):
             if int(container) in SERVICES:
                 declared[int(host)] = SERVICES[int(container)]
     for port, service in sorted(declared.items()):
-        if port_open(port):
+        down = f"{service} ({compose}) is not reachable on localhost:{port}"
+        if wait_for_port(port, port_wait):
             add(OK, f"{service} reachable on localhost:{port}", None)
-        elif on_path("docker"):
-            add(FAIL, f"{service} ({compose}) is not reachable on localhost:{port}", "docker compose up -d",
-                [["docker", "compose", "up", "-d"]])
+        elif not on_path("docker"):
+            add(FAIL, down, "install Docker, then: docker compose up -d")
+        elif not docker_running():
+            add(FAIL, down, "start Docker (open Docker Desktop), then: docker compose up -d")
         else:
-            add(FAIL, f"{service} ({compose}) is not reachable on localhost:{port}",
-                "install Docker, then: docker compose up -d")
+            add(FAIL, down, "docker compose up -d", [["docker", "compose", "up", "-d"]])
     return checks
 
 
@@ -540,7 +560,8 @@ def main(argv=None):
     # Only when a person is watching: never in CI, and never when the output is going to a file.
     if not args.ci and sys.stdout.isatty() and offer_fixes(args.path, checks):
         print()
-        code = report(diagnose(args.path), color)
+        started = any(cmd[0] == "docker" for *_, run in checks for cmd in run or ())
+        code = report(diagnose(args.path, port_wait=20 if started else 0), color)
     return code
 
 

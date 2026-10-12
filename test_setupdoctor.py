@@ -21,11 +21,12 @@ def repo(files):
     return root
 
 
-def machine(node=None, python=(3, 13, 0), tools=(), open_ports=(), off_path=()):
+def machine(node=None, python=(3, 13, 0), tools=(), open_ports=(), off_path=(), docker_up=True):
     """Fake the machine so results don't depend on what's installed here.
     `off_path` are programs in npm's global folder that PATH doesn't reach."""
     rd.run_version = lambda *cmds: node if cmds[0] == "node" else python
     rd.on_path = lambda cmd: cmd in tools
+    rd.docker_running = lambda: docker_up and "docker" in tools
     rd.npm_global = lambda name: f"/npm-global/{name}" if name in off_path else None
     rd.port_open = lambda port: port in open_ports
 
@@ -168,6 +169,22 @@ def test_services():
 
     machine(open_ports=(5433,))
     assert [s for s, *_ in rd.diagnose(root, env={"VIRTUAL_ENV": "x"})] == [OK]
+
+    # Docker installed but not started: say so, and don't offer a command that can only fail
+    machine(tools=("docker",), docker_up=False)
+    (check,) = rd.diagnose(root, env={"VIRTUAL_ENV": "x"})
+    assert check[2:] == ("start Docker (open Docker Desktop), then: docker compose up -d", None), check
+
+    # a container that was just started gets a moment to begin listening
+    attempts = []
+    rd.port_open = lambda port: attempts.append(port) or len(attempts) >= 3
+    real_sleep, rd.time.sleep = rd.time.sleep, lambda seconds: None
+    try:
+        assert rd.wait_for_port(5433, 20) and len(attempts) == 3
+        rd.port_open = lambda port: False
+        assert not rd.wait_for_port(1, 0)  # no waiting unless asked
+    finally:
+        rd.time.sleep = real_sleep
 
 
 def test_cli_output():
