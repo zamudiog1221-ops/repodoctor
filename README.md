@@ -1,10 +1,10 @@
-# repodoctor
+# setupdoctor
 
 `brew doctor` for any repo. It reads what a project needs from its code and config files, checks your machine, and prints the fix for each gap. It never reads the README.
 
 ```
-$ repodoctor
-repodoctor: 5 checks
+$ setupdoctor
+setupdoctor: 5 checks
 
   ✓ Node >=12.0.0 required (package.json engines), found 26.10.0
   ✗ yarn is this repo's package manager but is not installed
@@ -29,17 +29,27 @@ Not on PyPI yet. From a copy of this folder:
 pip install .
 ```
 
-It is one file with no dependencies, so `python repodoctor.py` also works.
+It is one file with no dependencies, so `python setupdoctor.py` also works.
 
 ## Use
 
 ```
-repodoctor            # check the current folder
-repodoctor path/to/repo
-repodoctor --ci       # for pipelines, see below
+setupdoctor            # check the current folder
+setupdoctor path/to/repo
+setupdoctor --ci       # for pipelines, see below
 ```
 
-The exit code is 1 if any check failed. It only reports; it never changes anything on your machine.
+The exit code is 1 if any check failed. A check only reports; it never changes anything on your machine.
+
+## Run it automatically after every clone
+
+```
+setupdoctor --install-hook
+```
+
+Do this once. From then on, every `git clone` prints the checklist for the new repo as soon as the clone finishes. It stays silent on repos with nothing to check and when you switch branches.
+
+This is the one command that changes your machine: it adds a `post-checkout` hook to git's template folder and points `init.templateDir` in your global git config at it. Repos you cloned earlier are not affected. Undo it with `setupdoctor --uninstall-hook`.
 
 ## What it checks
 
@@ -63,7 +73,7 @@ Softer reads such as `os.getenv("X")` or a bare `process.env.X` are treated as s
 
 ## CI mode
 
-`repodoctor --ci` ignores the machine and fails if the code reads an environment variable that is not in `.env.example`. Run it on every pull request and the example file cannot fall behind the code.
+`setupdoctor --ci` ignores the machine and fails if the code reads an environment variable that is not in `.env.example`. Run it on every pull request and the example file cannot fall behind the code.
 
 ## Limits
 
@@ -79,5 +89,5 @@ Softer reads such as `os.getenv("X")` or a bare `process.env.X` are treated as s
 ## Tests
 
 ```
-python test_repodoctor.py
+python test_setupdoctor.py
 ```

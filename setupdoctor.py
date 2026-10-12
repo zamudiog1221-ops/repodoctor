@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""repodoctor: read a repo's setup requirements from its code and check them against this machine."""
+"""setupdoctor: read a repo's setup requirements from its code and check them against this machine."""
 import argparse
 import ast
 import json
@@ -310,7 +310,7 @@ def diagnose(root, ci=False, env=os.environ):
     if undocumented and example:
         shown = ", ".join(undocumented[:5]) + (f" and {len(undocumented) - 5} more" if len(undocumented) > 5 else "")
         add(WARN, f"{len(undocumented)} variable(s) the code reads are missing from {example}: {shown}",
-            "repodoctor --ci lists each one with its location")
+            "setupdoctor --ci lists each one with its location")
 
     declared = {}
     compose = next((n for n in ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml")
@@ -329,12 +329,58 @@ def diagnose(root, ci=False, env=os.environ):
     return checks
 
 
+# Git copies this into every new clone and runs it after checkout. $1 is the previous HEAD, which is
+# all zeros only on a fresh clone, so switching branches later stays silent.
+HOOK = """#!/bin/sh
+# Installed by setupdoctor. Remove with: setupdoctor --uninstall-hook
+case "$1" in *[!0]*) exit 0 ;; esac
+[ -x "{python}" ] && "{python}" -m setupdoctor --hook
+exit 0
+"""
+
+
+def git_global(*args):
+    return subprocess.run(["git", "config", "--global", *args], capture_output=True, text=True).stdout.strip()
+
+
+def clone_hook(install):
+    """Add or remove the git template hook that runs setupdoctor after every `git clone`."""
+    own = Path.home() / ".setupdoctor" / "git-template"
+    template = Path(git_global("init.templateDir") or own).expanduser()  # reuse a template folder you already have
+    hook = template / "hooks" / "post-checkout"
+    ours = "setupdoctor" in read(hook)
+    if not install:
+        if ours:
+            hook.unlink()
+        if template == own:
+            git_global("--unset", "init.templateDir")
+        return 0, "Removed. New clones no longer run setupdoctor." if ours else "No setupdoctor hook was installed."
+    if hook.exists() and not ours:
+        return 1, f"{hook} already exists and isn't setupdoctor's, so it was left alone."
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text(HOOK.format(python=Path(sys.executable).as_posix()), encoding="utf-8", newline="\n")
+    hook.chmod(0o755)
+    git_global("init.templateDir", template.as_posix())
+    return 0, ("Installed. Every `git clone` from now on runs setupdoctor in the new folder.\n"
+               "Repos you already cloned are not affected. Undo with: setupdoctor --uninstall-hook")
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="repodoctor", description=__doc__.split(": ", 1)[1])
+    ap = argparse.ArgumentParser(prog="setupdoctor", description=__doc__.split(": ", 1)[1])
     ap.add_argument("path", nargs="?", default=".", help="repo to check (default: current folder)")
     ap.add_argument("--ci", action="store_true",
                     help="only check that every env var the code reads is in .env.example (for pipelines)")
+    ap.add_argument("--install-hook", action="store_true",
+                    help="run setupdoctor automatically after every git clone (changes your global git config)")
+    ap.add_argument("--uninstall-hook", action="store_true", help="undo --install-hook")
+    ap.add_argument("--hook", action="store_true", help=argparse.SUPPRESS)  # set by the git hook: quiet if nothing to check
     args = ap.parse_args(argv)
+    if args.install_hook or args.uninstall_hook:
+        if not on_path("git"):
+            ap.error("git was not found on PATH")
+        code, message = clone_hook(install=args.install_hook)
+        print(message)
+        return code
     if not Path(args.path).is_dir():
         ap.error(f"not a folder: {args.path}")
     try:
@@ -346,11 +392,13 @@ def main(argv=None):
         os.system("")  # switches older Windows consoles to ANSI colour mode
 
     checks = diagnose(args.path, ci=args.ci)
+    if not checks and args.hook:
+        return 0
     if not checks:
-        print("repodoctor: " + ("the code reads no environment variables that need documenting" if args.ci
+        print("setupdoctor: " + ("the code reads no environment variables that need documenting" if args.ci
                                 else "nothing to check here (no Node or Python requirements found)"))
         return 0
-    print(f"repodoctor: {len(checks)} check{'s' * (len(checks) != 1)}\n")
+    print(f"setupdoctor: {len(checks)} check{'s' * (len(checks) != 1)}\n")
     for status, message, fix in checks:
         mark, code = MARK[status]
         print(f"  \033[{code}m{mark}\033[0m {message}" if color else f"  {mark} {message}")

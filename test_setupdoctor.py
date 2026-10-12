@@ -1,16 +1,19 @@
-"""Run with: python test_repodoctor.py"""
+"""Run with: python test_setupdoctor.py"""
 import contextlib
 import io
+import os
+import shutil
+import subprocess
 import tempfile
 import textwrap
 from pathlib import Path
 
-import repodoctor as rd
-from repodoctor import FAIL, OK, WARN
+import setupdoctor as rd
+from setupdoctor import FAIL, OK, WARN
 
 
 def repo(files):
-    root = Path(tempfile.mkdtemp(prefix="repodoctor-test-"))
+    root = Path(tempfile.mkdtemp(prefix="setupdoctor-test-"))
     for name, content in files.items():
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -171,6 +174,35 @@ def test_cli_output():
     assert code == 1 and "\033" not in out.getvalue() and "1 failed" in out.getvalue(), out.getvalue()
     with contextlib.redirect_stdout(io.StringIO()):
         assert rd.main([str(repo({"notes.txt": "hi"}))]) == 0
+
+
+def test_clone_hook():
+    """Real git, but pointed at a throwaway global config and home folder."""
+    if not shutil.which("git"):
+        return print("     (skipped: git not installed)")
+    home = repo({})
+    saved = dict(os.environ)
+    os.environ.update(GIT_CONFIG_GLOBAL=str(home / "gitconfig"), HOME=str(home), USERPROFILE=str(home),
+                      PYTHONPATH=str(Path(__file__).parent))
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com"]
+
+    def run(*args, cwd=None):
+        done = subprocess.run([*git, *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8")
+        return done.stdout + done.stderr
+
+    try:
+        assert rd.clone_hook(install=True)[0] == 0
+        source = repo({".nvmrc": "999\n", "package.json": "{}"})
+        run("init", "-q", cwd=source), run("add", "-A", cwd=source), run("commit", "-qm", "x", cwd=source)
+        clone = home / "clone"
+        out = run("clone", "-q", str(source), str(clone))
+        assert "Node 999 required" in out, out  # the hook ran setupdoctor in the new clone
+        assert "setupdoctor" not in run("checkout", "-b", "other", cwd=clone)  # but not on a branch switch
+        assert rd.clone_hook(install=False)[0] == 0
+        assert "setupdoctor" not in run("clone", "-q", str(source), str(home / "clone2"))
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
 
 
 if __name__ == "__main__":
