@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 572" width="720" height="572" role="img" aria-labelledby="t d">
+  <title id="t">setupdoctor running after git clone</title>
+  <desc id="d">A git clone of node-express-boilerplate finishes. setupdoctor prints five checks: the Node version passes; yarn, the dependencies, the .env file and MongoDB fail, each with its fix. It then lists four commands it can run and asks: Run them now?</desc>
+  <style>
+    text { font: 14px ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; fill: #1A1815; }
+    .meta { font: 600 11px Inter, Archivo, Helvetica, Arial, sans-serif; letter-spacing: 0.14em; }
+    .bad { fill: #B23A29; font-weight: 700; }
+    .ask { font-weight: 700; }
+    .l { opacity: 0; animation: in 0.01s linear forwards; }
+    .cover { animation: type 1.5s steps(62) 0.4s forwards; }
+    @keyframes in { to { opacity: 1; } }
+    @keyframes type { to { transform: translateX(540px); } }
+    @media (prefers-reduced-motion: reduce) {
+      .l { opacity: 1; animation: none; }
+      .cover { display: none; }
+    }
+  </style>
+
+  <rect width="720" height="572" fill="#EDE9E0"/>
+  <text class="meta" x="28" y="30">SETUPDOCTOR</text>
+  <text class="meta" x="692" y="30" text-anchor="end">AFTER GIT CLONE</text>
+  <line x1="0" y1="46" x2="720" y2="46" stroke="#8C857A"/>
+
+  <text x="28" y="78">$ git clone https://github.com/hagopj13/node-express-boilerplate</text>
+  <rect class="cover" x="44" y="62" width="676" height="24" fill="#EDE9E0"/>
+
+  <text class="l" style="animation-delay:2.3s" x="28" y="100">Cloning into 'node-express-boilerplate'...</text>
+  <text class="l" style="animation-delay:3.1s" x="28" y="122">setupdoctor: 5 checks</text>
+
+  <g class="l" style="animation-delay:3.6s">
+    <text x="45" y="166">✓</text>
+    <text x="62" y="166">Node &gt;=12.0.0 required (package.json engines), found 26.10.0</text>
+  </g>
+  <g class="l" style="animation-delay:4.0s">
+    <text class="bad" x="45" y="188">✗</text>
+    <text x="62" y="188">yarn is this repo's package manager but is not installed</text>
+    <text x="78" y="210">fix: npm install -g yarn</text>
+  </g>
+  <g class="l" style="animation-delay:4.4s">
+    <text class="bad" x="45" y="232">✗</text>
+    <text x="62" y="232">Node dependencies not installed (no node_modules folder)</text>
+    <text x="78" y="254">fix: yarn install</text>
+  </g>
+  <g class="l" style="animation-delay:4.8s">
+    <text class="bad" x="45" y="276">✗</text>
+    <text x="62" y="276">No .env file; .env.example defines 12 variable(s)</text>
+    <text x="78" y="298">fix: cp .env.example .env, then fill in the values</text>
+  </g>
+  <g class="l" style="animation-delay:5.2s">
+    <text class="bad" x="45" y="320">✗</text>
+    <text x="62" y="320">MongoDB (docker-compose.yml) is not reachable on localhost:27017</text>
+    <text x="78" y="342">fix: docker compose up -d</text>
+  </g>
+
+  <text class="l" style="animation-delay:5.8s" x="28" y="386">4 failed, 0 warning(s), 1 passed</text>
+
+  <g class="l" style="animation-delay:6.8s">
+    <text x="28" y="430">setupdoctor can run these for you:</text>
+    <text x="45" y="452">npm install -g yarn</text>
+    <text x="45" y="474">yarn install</text>
+    <text x="45" y="496">copy .env.example .env</text>
+    <text x="45" y="518">docker compose up -d</text>
+  </g>
+  <g class="l" style="animation-delay:7.8s">
+    <text class="ask" x="28" y="540">Run them now? [y/N]</text>
+    <rect x="197" y="527" width="9" height="17" fill="#B23A29"/>
+  </g>
+
+  <rect x="0.5" y="0.5" width="719" height="571" fill="none" stroke="#1A1815"/>
+</svg>

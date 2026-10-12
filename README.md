@@ -2,6 +2,10 @@
 
 `brew doctor` for any repo. It reads what a project needs from its code and config files, checks your machine, and prints the fix for each gap. It never reads the README.
 
+![setupdoctor running after git clone: one check passes, four fail with their fixes, then it offers to run them](https://raw.githubusercontent.com/zamudiog1221-ops/setupdoctor/main/demo.svg)
+
+The animation re-creates setupdoctor's real output for `hagopj13/node-express-boilerplate`. The same checklist as text:
+
 ```
 $ setupdoctor
 setupdoctor: 5 checks
