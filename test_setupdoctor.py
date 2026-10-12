@@ -21,10 +21,12 @@ def repo(files):
     return root
 
 
-def machine(node=None, python=(3, 13, 0), tools=(), open_ports=()):
-    """Fake the machine so results don't depend on what's installed here."""
+def machine(node=None, python=(3, 13, 0), tools=(), open_ports=(), off_path=()):
+    """Fake the machine so results don't depend on what's installed here.
+    `off_path` are programs in npm's global folder that PATH doesn't reach."""
     rd.run_version = lambda *cmds: node if cmds[0] == "node" else python
     rd.on_path = lambda cmd: cmd in tools
+    rd.npm_global = lambda name: f"/npm-global/{name}" if name in off_path else None
     rd.port_open = lambda port: port in open_ports
 
 
@@ -205,6 +207,15 @@ def test_offer_fixes():
         assert rd.offer_fixes(root, rd.diagnose(repo({"package.json": "{}", ".nvmrc": "18"}), env={})) is False
     finally:
         rd.ask, rd.run_fixes = real_ask, real_run
+
+
+def test_package_manager_installed_but_not_on_path():
+    """npm's global folder is often missing from PATH; yarn there is usable, just not by typing `yarn`."""
+    machine(node=(20, 0, 0), tools=("npm",), off_path=("yarn",))
+    checks = rd.diagnose(repo({"package.json": '{"dependencies": {"x": "1"}}', "yarn.lock": ""}), env={})
+    assert has(checks, WARN, "yarn is installed in /npm-global, but that folder is not on your PATH")
+    assert not has(checks, FAIL, "yarn is this repo's package manager")
+    assert [run for *_, run in checks if run] == [[["yarn", "install"]]]  # no second `npm install -g yarn`
 
 
 def test_fix_commands_never_come_from_the_repo():

@@ -10,6 +10,7 @@ if sys.path and os.path.abspath(sys.path[0] or ".") == os.getcwd() != os.path.di
 
 import argparse  # noqa: E402
 import ast  # noqa: E402
+import functools  # noqa: E402
 import json  # noqa: E402
 import re  # noqa: E402
 import shutil  # noqa: E402
@@ -135,6 +136,24 @@ def run_version(*cmds):
 
 def on_path(cmd):
     return which(cmd) is not None
+
+
+@functools.lru_cache(maxsize=None)
+def npm_prefix():
+    npm = which("npm")
+    try:
+        return subprocess.run([npm, "prefix", "-g"], capture_output=True, text=True, timeout=30).stdout.strip() if npm else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def npm_global(name):
+    """Full path of a program in npm's global folder, or None. That folder is often missing from PATH
+    (a Windows machine set up without admin rights, for one), so `npm install -g yarn` can succeed and
+    `yarn` still not be found."""
+    prefix = npm_prefix()
+    candidate = os.path.join(prefix, name + ".cmd") if os.name == "nt" else os.path.join(prefix, "bin", name)
+    return candidate if prefix and os.path.isfile(candidate) else None
 
 
 def port_open(port):
@@ -291,7 +310,12 @@ def diagnose(root, ci=False, env=os.environ):
         if pm not in NODE_PMS:  # anything else is text from the repo, not a program we know
             pm = next((p for f, p in NODE_LOCKS if (root / f).exists()), "npm")
         have_pm, get_pm = on_path(pm), None
-        if pm != "npm" and not have_pm:
+        if pm != "npm" and not have_pm and npm_global(pm):
+            have_pm = True  # setupdoctor can still run it by its full path
+            folder = os.path.dirname(npm_global(pm))
+            add(WARN, f"{pm} is installed in {folder}, but that folder is not on your PATH, so typing `{pm}` won't work",
+                f"add {folder} to your PATH")
+        elif pm != "npm" and not have_pm:
             get_pm = INSTALL[pm] if on_path("npm") else None
             add(FAIL, f"{pm} is this repo's package manager but is not installed", " ".join(INSTALL[pm]),
                 get_pm and [get_pm])
@@ -401,7 +425,8 @@ def run_fixes(root, actions):
                 print(f"created {cmd[2]}; fill in its values before you run the app")
             continue
         # the virtualenv this run just created is the only program taken from inside the repo
-        exe = str(root / cmd[0]) if cmd[0] == VENV_PYTHON else cmd[0] if os.path.isabs(cmd[0]) else which(cmd[0])
+        exe = (str(root / cmd[0]) if cmd[0] == VENV_PYTHON else cmd[0] if os.path.isabs(cmd[0])
+               else which(cmd[0]) or npm_global(cmd[0]))
         try:
             failed = not exe or subprocess.run([exe, *cmd[1:]], cwd=root).returncode != 0
         except OSError:

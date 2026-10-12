@@ -56,6 +56,8 @@ Answer `y` and it runs them in order, stops at the first one that fails, then ch
 
 What it can run: installing the package manager, installing dependencies, creating a Python virtualenv, copying `.env.example` to `.env` (never over an existing file), and `docker compose up -d`.
 
+If npm's global folder is not on your PATH, which is common on Windows machines set up without admin rights, `npm install -g yarn` succeeds but `yarn` is still not found. setupdoctor detects that, runs yarn from that folder itself, and tells you which folder to add to your PATH.
+
 What it leaves to you:
 
 - A wrong Node or Python version. Version managers work by changing your terminal session, which a program can't do for you. Dependencies are not installed until the version is right.
