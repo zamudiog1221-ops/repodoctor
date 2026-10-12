@@ -12,6 +12,15 @@ import setupdoctor as rd
 from setupdoctor import FAIL, OK, WARN
 
 
+REAL = {name: getattr(rd, name) for name in ("run_version", "on_path", "npm_global", "docker_running", "port_open")}
+
+
+def real_machine():
+    """Undo machine(): the end-to-end tests use the programs that are really installed."""
+    for name, fn in REAL.items():
+        setattr(rd, name, fn)
+
+
 def repo(files):
     root = Path(tempfile.mkdtemp(prefix="setupdoctor-test-"))
     for name, content in files.items():
@@ -295,6 +304,57 @@ def test_clone_hook():
     finally:
         os.environ.clear()
         os.environ.update(saved)
+
+
+def test_ask_reads_from_the_terminal():
+    """The y/N question is read from the terminal device itself, not stdin. Checked with a real
+    pseudo-terminal, which only Mac and Linux have."""
+    if os.name == "nt":
+        return print("     (skipped: no pseudo-terminals on Windows; checked by hand there)")
+    import pty
+    pid, terminal = pty.fork()
+    if pid == 0:  # child: its controlling terminal is the pseudo-terminal
+        os._exit(0 if rd.ask("Run them now? [y/N] ") == "y" else 1)
+    seen = b""
+    while b"[y/N]" not in seen:
+        seen += os.read(terminal, 1024)
+    os.write(terminal, b"y\n")
+    assert os.waitpid(pid, 0)[1] == 0, seen
+
+
+def test_real_fixes():
+    """End to end with the real npm, pip and the network: say yes, and everything gets installed."""
+    if not os.environ.get("SETUPDOCTOR_INTEGRATION"):
+        return print("     (skipped: downloads packages; set SETUPDOCTOR_INTEGRATION=1 to run)")
+    real_machine()
+    root = repo({"package.json": '{"dependencies": {"is-number": "7.0.0"}}', "requirements.txt": "six==1.16.0\n",
+                 ".env.example": "KEY=\n"})
+    real_ask, rd.ask = rd.ask, lambda question: "y"
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert rd.offer_fixes(root, rd.diagnose(root, env={})) is True
+    finally:
+        rd.ask = real_ask
+    assert (root / "node_modules" / "is-number").is_dir() and (root / ".env").is_file()
+    assert subprocess.run([str(root / rd.VENV_PYTHON), "-c", "import six"]).returncode == 0
+    after = rd.diagnose(root, env={})
+    assert [s for s, *_ in after] == [OK], after  # nothing left to fix
+
+
+def test_real_docker():
+    """`docker compose up -d` for real, then the re-check waits for the service to start listening."""
+    if not os.environ.get("SETUPDOCTOR_DOCKER"):
+        return print("     (skipped: needs a running Docker engine; set SETUPDOCTOR_DOCKER=1 to run)")
+    real_machine()
+    root = repo({"docker-compose.yml": 'services:\n  cache:\n    image: redis:7-alpine\n    ports:\n      - "6379:6379"\n'})
+    checks = rd.diagnose(root, env={})
+    assert [run for *_, run in checks] == [[["docker", "compose", "up", "-d"]]], checks
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert rd.run_fixes(root, checks[0][3]) is True
+        assert [s for s, *_ in rd.diagnose(root, env={}, port_wait=30)] == [OK]
+    finally:
+        subprocess.run(["docker", "compose", "down"], cwd=root)
 
 
 if __name__ == "__main__":
