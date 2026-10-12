@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """setupdoctor: read a repo's setup requirements from its code and check them against this machine."""
-import argparse
-import ast
-import json
 import os
-import re
-import shutil
-import socket
-import subprocess
 import sys
-import warnings
-from pathlib import Path
+
+# `python -m setupdoctor` puts the current folder first on the import path. That folder is a repo we
+# don't trust, so drop it before importing anything a file in it could shadow (ast.py, json.py, ...).
+if sys.path and os.path.abspath(sys.path[0] or ".") == os.getcwd() != os.path.dirname(os.path.abspath(__file__)):
+    del sys.path[0]
+
+import argparse  # noqa: E402
+import ast  # noqa: E402
+import json  # noqa: E402
+import re  # noqa: E402
+import shutil  # noqa: E402
+import socket  # noqa: E402
+import subprocess  # noqa: E402
+import warnings  # noqa: E402
+from pathlib import Path  # noqa: E402
 
 OK, FAIL, WARN = "ok", "fail", "warn"
 MARK = {OK: ("✓", "32"), FAIL: ("✗", "31"), WARN: ("!", "33")}
@@ -41,8 +47,13 @@ ENV_EXAMPLES = [".env.example", ".env.sample", ".env.template", ".env.dist"]
 
 NODE_LOCKS = [("pnpm-lock.yaml", "pnpm"), ("yarn.lock", "yarn"), ("bun.lockb", "bun"), ("bun.lock", "bun")]
 PY_LOCKS = [("uv.lock", "uv"), ("poetry.lock", "poetry"), ("Pipfile", "pipenv")]
-INSTALL = {"pnpm": "npm install -g pnpm", "yarn": "npm install -g yarn", "bun": "npm install -g bun",
-           "uv": "pip install uv", "poetry": "pipx install poetry", "pipenv": "pip install pipenv"}
+NODE_PMS = {"npm", "yarn", "pnpm", "bun"}
+INSTALL = {"pnpm": ["npm", "install", "-g", "pnpm"], "yarn": ["npm", "install", "-g", "yarn"],
+           "bun": ["npm", "install", "-g", "bun"], "uv": ["pip", "install", "uv"],
+           "poetry": ["pipx", "install", "poetry"], "pipenv": ["pip", "install", "pipenv"]}
+# Fixes setupdoctor can run are argument lists built from the names above, never from text in the repo.
+COPY = "copy"  # the one built-in action: [COPY, source, destination], done in Python
+VENV_PYTHON = ".venv/Scripts/python.exe" if os.name == "nt" else ".venv/bin/python"
 
 SERVICES = {5432: "Postgres", 6379: "Redis", 27017: "MongoDB", 3306: "MySQL"}
 # ponytail: pattern match, not a YAML parser; misses ports written as ${VAR:-5432}:5432. Parse YAML if that bites.
@@ -91,10 +102,25 @@ def satisfies(found, spec, n):
     return any(all(part_ok(p) for p in re.split(r"[,\s]+", a) if p) for a in alts if version(a))
 
 
+def which(name):
+    """Full path of a program on PATH. Unlike shutil.which on Windows, it never looks in the current
+    folder: that folder is a repo we don't trust, and a node.cmd planted there must not get run."""
+    exts = os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if os.name == "nt" else [""]
+    here = os.path.normcase(os.getcwd())
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        if not os.path.isabs(folder) or os.path.normcase(os.path.abspath(folder)) == here:
+            continue
+        for ext in exts:
+            candidate = os.path.join(folder, name + ext)
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+    return None
+
+
 def run_version(*cmds):
     """Version tuple of the first of `cmds` found on PATH, or None."""
     for cmd in cmds:
-        exe = shutil.which(cmd)
+        exe = which(cmd)
         if not exe:
             continue
         try:
@@ -108,7 +134,7 @@ def run_version(*cmds):
 
 
 def on_path(cmd):
-    return shutil.which(cmd) is not None
+    return which(cmd) is not None
 
 
 def port_open(port):
@@ -211,12 +237,14 @@ def check_version(label, found, spec, source, n, fix):
 
 
 def diagnose(root, ci=False, env=os.environ):
-    """Return a list of (status, message, fix) for the repo at `root`."""
+    """Return a list of (status, message, fix, run) for the repo at `root`.
+    `fix` is the text shown to the user; `run` is the list of commands setupdoctor can run to do it,
+    or None when it has to be done by hand."""
     root = Path(root)
     checks = []
 
-    def add(*check):
-        checks.append(check)
+    def add(status, message, fix=None, run=None):
+        checks.append((status, message, fix, run))
 
     reads = scan_env(root)
     example = next((n for n in ENV_EXAMPLES if (root / n).exists()), None)
@@ -248,23 +276,32 @@ def diagnose(root, ci=False, env=os.environ):
         engines = pkg.get("engines")
         specs = [(".nvmrc", first_line(root / ".nvmrc")), (".node-version", first_line(root / ".node-version")),
                  ("package.json engines", str(engines.get("node", "")) if isinstance(engines, dict) else "")]
+        node_ok = bool(node)
         for source, spec in specs:
             if version(spec):
-                add(*check_version("Node", node, spec, source, 1, f"nvm install {version(spec)[0]}"))
+                check = check_version("Node", node, spec, source, 1, f"nvm install {version(spec)[0]}")
+                node_ok = check[0] == OK
+                add(*check)
                 break
         else:
             if not node:
                 add(FAIL, "Node is needed (package.json) but was not found on PATH",
                     "install Node from https://nodejs.org")
-        pm = (str(pkg.get("packageManager") or "").split("@")[0]
-              or next((p for f, p in NODE_LOCKS if (root / f).exists()), "npm"))
-        if pm != "npm" and not on_path(pm):
-            add(FAIL, f"{pm} is this repo's package manager but is not installed", INSTALL.get(pm))
+        pm = str(pkg.get("packageManager") or "").split("@")[0]
+        if pm not in NODE_PMS:  # anything else is text from the repo, not a program we know
+            pm = next((p for f, p in NODE_LOCKS if (root / f).exists()), "npm")
+        have_pm, get_pm = on_path(pm), None
+        if pm != "npm" and not have_pm:
+            get_pm = INSTALL[pm] if on_path("npm") else None
+            add(FAIL, f"{pm} is this repo's package manager but is not installed", " ".join(INSTALL[pm]),
+                get_pm and [get_pm])
         if pkg.get("dependencies") or pkg.get("devDependencies"):
             if (root / "node_modules").is_dir():
                 add(OK, "Node dependencies installed (node_modules exists)", None)
-            else:
-                add(FAIL, "Node dependencies not installed (no node_modules folder)", f"{pm} install")
+            else:  # installing with the wrong Node can leave a broken node_modules, so that comes first
+                add(FAIL, "Node dependencies not installed (no node_modules folder)",
+                    f"{pm} install" + ("" if node_ok else " (after fixing the Node version)"),
+                    [[pm, "install"]] if node_ok and (have_pm or get_pm) else None)
 
     if is_py:
         pm = next((p for f, p in PY_LOCKS if (root / f).exists()), None)
@@ -272,23 +309,34 @@ def diagnose(root, ci=False, env=os.environ):
         specs = [(".python-version", first_line(root / ".python-version")),
                  ("runtime.txt", first_line(root / "runtime.txt")),
                  ("pyproject.toml", py_spec.group(1) if py_spec else "")]
+        py_ok = True
         if pm != "uv":  # uv downloads the right Python by itself
             python = run_version("python", "python3") or tuple(sys.version_info[:3])
             for source, spec in specs:
                 if version(spec):
                     want = ".".join(map(str, version(spec)[:2]))
-                    add(*check_version("Python", python, spec, source, 2,
-                                       f"install Python {want} (for example: pyenv install {want})"))
+                    check = check_version("Python", python, spec, source, 2,
+                                          f"install Python {want} (for example: pyenv install {want})")
+                    py_ok = check[0] == OK
+                    add(*check)
                     break
-        if pm and not on_path(pm):
-            add(FAIL, f"{pm} is this repo's package manager but is not installed", INSTALL.get(pm))
+        have_pm, get_pm = not pm or on_path(pm), None
+        if not have_pm:
+            get_pm = INSTALL[pm] if on_path(INSTALL[pm][0]) else None
+            add(FAIL, f"{pm} is this repo's package manager but is not installed", " ".join(INSTALL[pm]),
+                get_pm and [get_pm])
         # poetry and pipenv keep virtualenvs outside the repo, so there's nothing to look for.
         if pm in (None, "uv") and not env.get("VIRTUAL_ENV") \
                 and not any((root / d).is_dir() for d in (".venv", "venv", "env")):
-            install = ("uv sync" if pm == "uv" else "python -m venv .venv, activate it, then pip install "
-                       + ("-r requirements.txt" if (root / "requirements.txt").exists() else "-e ."))
+            if pm == "uv":
+                fix, run = "uv sync", [["uv", "sync"]] if have_pm or get_pm else None
+            else:
+                target = ["-r", "requirements.txt"] if (root / "requirements.txt").exists() else ["-e", "."]
+                fix = "python -m venv .venv, activate it, then pip install " + " ".join(target)
+                run = [[sys.executable, "-m", "venv", ".venv"],
+                       [VENV_PYTHON, "-m", "pip", "install", *target]] if py_ok else None
             add(WARN, "No virtual environment found (.venv or venv), so dependencies are probably not installed",
-                install)
+                fix, run)
 
     set_keys = env_keys(root, ENV_FILES)
     required = [v for v, (_, hard) in reads.items() if hard]
@@ -299,7 +347,7 @@ def diagnose(root, ci=False, env=os.environ):
     declared_unset = sorted(k for k in env_keys(root, ENV_EXAMPLES) if k not in env and k not in set_keys)
     if declared_unset and not any((root / n).exists() for n in ENV_FILES):
         add(FAIL, f"No .env file; {example} defines {len(declared_unset)} variable(s)",
-            f"cp {example} .env, then fill in the values")
+            f"cp {example} .env, then fill in the values", [[COPY, example, ".env"]])
         missing = [v for v in missing if v not in documented]
     elif set(declared_unset) - set(missing):
         add(WARN, f"In {example} but not in your .env: " + ", ".join(sorted(set(declared_unset) - set(missing))),
@@ -323,10 +371,72 @@ def diagnose(root, ci=False, env=os.environ):
     for port, service in sorted(declared.items()):
         if port_open(port):
             add(OK, f"{service} reachable on localhost:{port}", None)
+        elif on_path("docker"):
+            add(FAIL, f"{service} ({compose}) is not reachable on localhost:{port}", "docker compose up -d",
+                [["docker", "compose", "up", "-d"]])
         else:
             add(FAIL, f"{service} ({compose}) is not reachable on localhost:{port}",
-                "docker compose up -d" if on_path("docker") else "install Docker, then: docker compose up -d")
+                "install Docker, then: docker compose up -d")
     return checks
+
+
+def ask(question):
+    """Ask on the terminal itself, which also works inside the git hook, where stdin is disconnected.
+    Returns None when there is no terminal (CI, cron), so nothing ever waits for an answer there."""
+    try:
+        with open("CONIN$" if os.name == "nt" else "/dev/tty", encoding="utf-8", errors="replace") as terminal:
+            print(question, end="", flush=True)
+            return terminal.readline().strip().lower()
+    except OSError:
+        return None
+
+
+def run_fixes(root, actions):
+    """Run each action in the repo folder, stopping at the first failure. True if all succeeded."""
+    for cmd in actions:
+        print(f"\n> {' '.join(cmd)}", flush=True)
+        if cmd[0] == COPY:
+            if not (root / cmd[2]).exists():  # never overwrite
+                shutil.copyfile(root / cmd[1], root / cmd[2])
+                print(f"created {cmd[2]}; fill in its values before you run the app")
+            continue
+        # the virtualenv this run just created is the only program taken from inside the repo
+        exe = str(root / cmd[0]) if cmd[0] == VENV_PYTHON else cmd[0] if os.path.isabs(cmd[0]) else which(cmd[0])
+        try:
+            failed = not exe or subprocess.run([exe, *cmd[1:]], cwd=root).returncode != 0
+        except OSError:
+            failed = True
+        if failed:
+            print(f"\nsetupdoctor: `{' '.join(cmd)}` did not succeed, so the steps after it were skipped.")
+            return False
+    return True
+
+
+def offer_fixes(root, checks):
+    """List the fixes setupdoctor can run, ask, and run them on a yes. True if anything was run."""
+    actions = []
+    for *_, run in checks:
+        actions += [cmd for cmd in run or () if cmd not in actions]
+    if not actions:
+        return False
+    listing = "".join(f"  {' '.join(cmd)}\n" for cmd in actions)
+    if ask(f"\nsetupdoctor can run these for you:\n{listing}Run them now? [y/N] ") not in ("y", "yes"):
+        return False
+    run_fixes(Path(root), actions)
+    return True
+
+
+def report(checks, color):
+    """Print the checklist and summary; return the exit code."""
+    print(f"setupdoctor: {len(checks)} check{'s' * (len(checks) != 1)}\n")
+    for status, message, fix, _ in checks:
+        mark, code = MARK[status]
+        print(f"  \033[{code}m{mark}\033[0m {message}" if color else f"  {mark} {message}")
+        if fix:
+            print(f"      fix: {fix}")
+    count = {s: sum(c[0] == s for c in checks) for s in (FAIL, WARN, OK)}
+    print(f"\n{count[FAIL]} failed, {count[WARN]} warning(s), {count[OK]} passed")
+    return 1 if count[FAIL] else 0
 
 
 # Git copies this into every new clone and runs it after checkout. $1 is the previous HEAD, which is
@@ -334,13 +444,15 @@ def diagnose(root, ci=False, env=os.environ):
 HOOK = """#!/bin/sh
 # Installed by setupdoctor. Remove with: setupdoctor --uninstall-hook
 case "$1" in *[!0]*) exit 0 ;; esac
-[ -x "{python}" ] && "{python}" -m setupdoctor --hook
+[ -x "{python}" ] && "{python}" "{script}" --hook
 exit 0
 """
+# The hook runs this file by its full path, not `-m setupdoctor`: -m would put the freshly cloned,
+# untrusted repo first on Python's import path.
 
 
 def git_global(*args):
-    return subprocess.run(["git", "config", "--global", *args], capture_output=True, text=True).stdout.strip()
+    return subprocess.run([which("git"), "config", "--global", *args], capture_output=True, text=True).stdout.strip()
 
 
 def clone_hook(install):
@@ -358,7 +470,8 @@ def clone_hook(install):
     if hook.exists() and not ours:
         return 1, f"{hook} already exists and isn't setupdoctor's, so it was left alone."
     hook.parent.mkdir(parents=True, exist_ok=True)
-    hook.write_text(HOOK.format(python=Path(sys.executable).as_posix()), encoding="utf-8", newline="\n")
+    hook.write_text(HOOK.format(python=Path(sys.executable).as_posix(), script=Path(__file__).resolve().as_posix()),
+                    encoding="utf-8", newline="\n")
     hook.chmod(0o755)
     git_global("init.templateDir", template.as_posix())
     return 0, ("Installed. Every `git clone` from now on runs setupdoctor in the new folder.\n"
@@ -398,15 +511,12 @@ def main(argv=None):
         print("setupdoctor: " + ("the code reads no environment variables that need documenting" if args.ci
                                 else "nothing to check here (no Node or Python requirements found)"))
         return 0
-    print(f"setupdoctor: {len(checks)} check{'s' * (len(checks) != 1)}\n")
-    for status, message, fix in checks:
-        mark, code = MARK[status]
-        print(f"  \033[{code}m{mark}\033[0m {message}" if color else f"  {mark} {message}")
-        if fix:
-            print(f"      fix: {fix}")
-    count = {s: sum(c[0] == s for c in checks) for s in (FAIL, WARN, OK)}
-    print(f"\n{count[FAIL]} failed, {count[WARN]} warning(s), {count[OK]} passed")
-    return 1 if count[FAIL] else 0
+    code = report(checks, color)
+    # Only when a person is watching: never in CI, and never when the output is going to a file.
+    if not args.ci and sys.stdout.isatty() and offer_fixes(args.path, checks):
+        print()
+        code = report(diagnose(args.path), color)
+    return code
 
 
 if __name__ == "__main__":

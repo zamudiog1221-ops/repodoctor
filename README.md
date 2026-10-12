@@ -37,7 +37,32 @@ setupdoctor path/to/repo
 setupdoctor --ci       # for pipelines, see below
 ```
 
-The exit code is 1 if any check failed. A check only reports; it never changes anything on your machine.
+The exit code is 1 if any check failed.
+
+## It offers to fix what it can
+
+After the checklist, setupdoctor lists the fixes it can run itself and asks before doing anything:
+
+```
+setupdoctor can run these for you:
+  npm install -g yarn
+  yarn install
+  copy .env.example .env
+  docker compose up -d
+Run them now? [y/N]
+```
+
+Answer `y` and it runs them in order, stops at the first one that fails, then checks again. Anything else, including just pressing Enter, changes nothing. It never asks in CI, with `--ci`, or when the output is going to a file.
+
+What it can run: installing the package manager, installing dependencies, creating a Python virtualenv, copying `.env.example` to `.env` (never over an existing file), and `docker compose up -d`.
+
+What it leaves to you:
+
+- A wrong Node or Python version. Version managers work by changing your terminal session, which a program can't do for you. Dependencies are not installed until the version is right.
+- Secret values. It creates `.env`, but only you know what goes in it.
+- Installing Node or Docker themselves.
+
+The commands come from a fixed list inside setupdoctor, never from text in the repo. Installing a project's dependencies does run that project's own install scripts, as `npm install` always does, so answer `n` for a repo you don't trust.
 
 ## Run it automatically after every clone
 
@@ -45,7 +70,9 @@ The exit code is 1 if any check failed. A check only reports; it never changes a
 setupdoctor --install-hook
 ```
 
-Do this once. From then on, every `git clone` prints the checklist for the new repo as soon as the clone finishes. It stays silent on repos with nothing to check and when you switch branches.
+Do this once. From then on, every `git clone` prints the checklist for the new repo as soon as the clone finishes, followed by the same offer to fix things. It stays silent on repos with nothing to check and when you switch branches.
+
+If you installed the hook with a version before 0.2.0, upgrade and run `setupdoctor --install-hook` again. The old hook started Python in a way that let a file in the cloned repo run as code.
 
 This is the one command that changes your machine: it adds a `post-checkout` hook to git's template folder and points `init.templateDir` in your global git config at it. Repos you cloned earlier are not affected. Undo it with `setupdoctor --uninstall-hook`.
 

