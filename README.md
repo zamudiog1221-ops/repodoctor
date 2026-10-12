@@ -23,13 +23,11 @@ That is real output from a fresh clone of `hagopj13/node-express-boilerplate`.
 
 ## Install
 
-Not on PyPI yet. From a copy of this folder:
-
 ```
-pip install .
+pip install setupdoctor
 ```
 
-It is one file with no dependencies, so `python setupdoctor.py` also works.
+It needs Python 3.9 or newer and has no dependencies.
 
 ## Use
 
