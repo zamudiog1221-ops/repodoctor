@@ -31,10 +31,11 @@ def repo(files):
     return root
 
 
-def machine(node=None, python=(3, 13, 0), tools=(), open_ports=(), off_path=(), docker_up=True):
+def machine(node=None, python=(3, 13, 0), tools=(), open_ports=(), off_path=(), docker_up=True, **versions):
     """Fake the machine so results don't depend on what's installed here.
-    `off_path` are programs in npm's global folder that PATH doesn't reach."""
-    rd.run_version = lambda *cmds: node if cmds[0] == "node" else python
+    `off_path` are programs in npm's global folder that PATH doesn't reach; extra keywords are the
+    versions of other programs, e.g. php=(8, 2, 0)."""
+    rd.run_version = lambda *cmds, cwd=None: {"node": node, "python": python, **versions}.get(cmds[0])
     rd.on_path = lambda cmd: cmd in tools
     rd.docker_running = lambda: docker_up and "docker" in tools
     rd.npm_global = lambda name: f"/npm-global/{name}" if name in off_path else None
@@ -305,6 +306,180 @@ def test_clone_hook():
     finally:
         os.environ.clear()
         os.environ.update(saved)
+
+
+def messages(checks, status):
+    return [msg for s, msg, *_ in checks if s == status]
+
+
+def test_other_languages():
+    # PHP: a version range, composer, and the vendor folder
+    php = {"composer.json": '{"require": {"php": "^8.1|^8.2", "laravel/framework": "^10.0"}}'}
+    machine(php=(7, 4, 0), tools=("composer",))
+    checks = rd.diagnose(repo(php), env={})
+    assert has(checks, FAIL, "PHP ^8.1 || ^8.2 required (composer.json), found 7.4.0")
+    assert checks[-1][2:] == ("composer install (after fixing the PHP version)", None), checks
+    machine(php=(8, 2, 1), tools=("composer",))
+    root = repo(php)
+    assert [(s, run) for s, _, _, run in rd.diagnose(root, env={})] == [(OK, None), (FAIL, [["composer", "install"]])]
+    (root / "vendor").mkdir()
+    assert [s for s, *_ in rd.diagnose(root, env={})] == [OK, OK]
+    machine(php=(8, 2, 1))
+    assert has(rd.diagnose(root, env={}), FAIL, "composer is needed (composer.json) but is not installed")
+
+    ruby = {"Gemfile": 'source "https://rubygems.org"\nruby "~> 3.2"\n', ".ruby-version": "ruby-3.3.0\n"}
+    machine(ruby=(3, 3, 5), tools=("bundle",))
+    assert [s for s, *_ in rd.diagnose(repo(ruby), env={})] == [OK]
+    machine(ruby=(3, 1, 0), tools=("bundle",))
+    assert has(rd.diagnose(repo(ruby), env={}), FAIL, "Ruby ruby-3.3.0 required (.ruby-version), found 3.1.0")
+
+    go = {"go.mod": "module example.com/x\n\ngo 1.23\n"}
+    machine(go=(1, 19, 0))
+    assert has(rd.diagnose(repo(go), env={}), FAIL, "Go >=1.23 required (go.mod), found 1.19.0")
+    machine(go=(1, 22, 0))  # old, but new enough to fetch 1.23 by itself
+    assert messages(rd.diagnose(repo(go), env={}), OK) == [
+        "Go >=1.23 required (go.mod), found 1.22.0, which downloads the newer toolchain itself"]
+    machine(go=(1, 23, 1))
+    assert messages(rd.diagnose(repo(go), env={}), OK) == ["Go >=1.23 required (go.mod), found 1.23.1"]
+
+    rust = {"Cargo.toml": '[package]\nname = "x"\nrust-version = "1.75"\n'}
+    machine(rustc=(1, 70, 0), tools=("cargo",))
+    assert has(rd.diagnose(repo(rust), env={}), FAIL, "Rust >=1.75 required (Cargo.toml), found 1.70.0")
+    machine(tools=("cargo", "rustup"))  # rustup present: the compiler is never run, rustup sorts it out
+    assert messages(rd.diagnose(repo(rust), env={}), OK) == [
+        "Rust >=1.75 required (Cargo.toml); rustup installs it the first time you build"]
+
+    java = {"pom.xml": "<project><properties><maven.compiler.release>17</maven.compiler.release></properties></project>"}
+    machine(java=(1, 8, 0))  # Java 8 reports itself as 1.8
+    checks = rd.diagnose(repo(java), env={})
+    assert has(checks, FAIL, "Java >=17 required (pom.xml), found 8.0")
+    assert has(checks, FAIL, "mvn is needed (pom.xml, and the repo has no mvnw wrapper)")
+    machine(java=(21, 0, 2))
+    assert [s for s, *_ in rd.diagnose(repo(dict(java, mvnw="#!/bin/sh\n")), env={})] == [OK]
+    gradle = {"build.gradle.kts": "java { toolchain { languageVersion.set(JavaLanguageVersion.of(21)) } }", "gradlew": ""}
+    machine(java=(17, 0, 1))
+    assert has(rd.diagnose(repo(gradle), env={}), FAIL, "Java >=21 required (build.gradle), found 17.0.1")
+
+    machine(dotnet=(9, 0, 100))
+    assert has(rd.diagnose(repo({"global.json": '{"sdk": {"version": "8.0.100"}}'}), env={}),
+               FAIL, ".NET 8.0.100 required (global.json), found 9.0.100")
+    assert [s for s, *_ in rd.diagnose(repo({"global.json": '{"sdk": {"version": "8.0.100", "rollForward": "latestMajor"}}'}),
+                                       env={})] == [OK]
+    assert [s for s, *_ in rd.diagnose(repo({"App.csproj": "<TargetFramework>net8.0</TargetFramework>"}), env={})] == [OK]
+
+
+def test_tool_versions():
+    """asdf's .tool-versions and mise.toml pin versions for any tool, not only the languages above."""
+    files = {".tool-versions": "nodejs 20.11.0\nterraform 1.7.0  # infra\nelixir 1.16.0\n", "package.json": "{}"}
+    machine(node=(18, 0, 0), terraform=(1, 7, 5))
+    checks = rd.diagnose(repo(files), env={})
+    assert messages(checks, FAIL) == ["Node 20.11.0 required (.tool-versions), found 18.0.0"]
+    assert messages(checks, OK) == ["Terraform 1.7.0 required (.tool-versions), found 1.7.5"]  # elixir: not a tool it knows
+    machine()
+    checks = rd.diagnose(repo({"mise.toml": '[tools]\ndeno = "1.40"\n\n[env]\nFOO = "1.2"\n'}), env={})
+    assert messages(checks, FAIL) == ["Deno 1.40 required (mise.toml), but no working Deno was found"]
+
+
+def test_monorepo():
+    files = {"backend/requirements.txt": "flask\n", "backend/.python-version": "3.12\n", "backend/.env.example": "SECRET=\n",
+             "backend/app.py": 'import os\nkey = os.environ["SHARED_KEY"]\n',
+             "frontend/package.json": '{"dependencies": {"react": "18"}}', "frontend/package-lock.json": "{}",
+             ".env": "SHARED_KEY=abc\n"}
+    machine(node=(20, 0, 0), python=(3, 10, 0), tools=("npm",))
+    root = repo(files)
+    checks = rd.diagnose(root, env={})
+    assert has(checks, FAIL, "[backend] Python 3.12 required (.python-version), found 3.10.0")
+    assert has(checks, OK, "[backend] All 1 required environment variables are set")  # from the .env at the top
+    runs = [cmd for *_, run in checks for cmd in run or ()]
+    assert runs == [[rd.IN, "backend", rd.COPY, ".env.example", ".env"], [rd.IN, "frontend", "npm", "install"]], runs
+    assert rd.show(runs[0]) == "(backend) copy .env.example .env"
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert rd.run_fixes(root, runs[:1]) is True
+    assert (root / "backend" / ".env").is_file() and not (root / ".env.example").exists()
+
+    # workspace packages are installed from the top folder, so they are not checked one by one...
+    workspace = {"package.json": '{"workspaces": ["packages/*"], "devDependencies": {"turbo": "2"}}',
+                 "packages/web/package.json": '{"dependencies": {"react": "18"}}',
+                 "packages/api/package.json": '{"dependencies": {"express": "4"}}',
+                 # ...unless a folder has its own lockfile, which makes it a separate install
+                 "tools/cli/package.json": '{"dependencies": {"yargs": "17"}}', "tools/cli/package-lock.json": "{}"}
+    machine(node=(20, 0, 0), tools=("npm",))
+    assert messages(rd.diagnose(repo(workspace), env={}), FAIL) == [
+        "Node dependencies not installed (no node_modules folder)",
+        "[tools/cli] Node dependencies not installed (no node_modules folder)"]
+
+
+def test_env_schemas():
+    """Settings schemas and guard clauses say which variables are required, with no .env.example needed."""
+    files = {
+        "src/guard.js": 'if (!process.env.API_KEY) {\n  throw new Error("API_KEY is required");\n}\n',
+        "src/env.mjs": """
+            import { createEnv } from "@t3-oss/env-nextjs";
+            import { z } from "zod";
+            export const env = createEnv({
+              server: {
+                DATABASE_URL: z.string().url(),
+                NEXTAUTH_SECRET: z.string().optional(),
+                LISTEN_PORT: z.coerce.number().default(3000),
+                LONG_ONE: z
+                  .string()
+                  .min(1),
+              },
+              runtimeEnv: { DATABASE_URL: process.env.DATABASE_URL },
+            });
+        """,
+        "src/config.js": """
+            const Joi = require('joi');
+            const schema = Joi.object().keys({
+              MONGODB_URL: Joi.string().required().description('Mongo DB url'),
+              SMTP_HOST: Joi.string().description('server that will send the emails'),
+            });
+            schema.validate(process.env);
+        """,
+        "src/clean.ts": """
+            import { cleanEnv, str, port } from 'envalid';
+            export default cleanEnv(process.env, {
+              API_TOKEN: str(),
+              HTTP_PORT: port({ default: 3000 }),
+            });
+        """,
+        "app/settings.py": """
+            from typing import Optional
+            from pydantic_settings import BaseSettings, SettingsConfigDict
+
+            class Settings(BaseSettings):
+                model_config = SettingsConfigDict(env_prefix="APP_")
+                database_url: str
+                debug: bool = False
+                token: Optional[str]
+                _private: str
+        """,
+        "app/django_settings.py": """
+            import environ
+            env = environ.Env(DEBUG=(bool, False))
+            SECRET_KEY = env("DJANGO_SECRET_KEY")
+            DEBUG = env("DEBUG")
+            DATABASES = {"default": env.db("DB_URL", default="sqlite:///db.sqlite3")}
+            CACHE = env.str("REDIS_URL")
+        """,
+        "app/decoupled.py": 'from decouple import config\nKEY = config("STRIPE_KEY")\nN = config("WORKERS", default=2, cast=int)\n',
+        # a deployment-only settings file: what it needs is not needed to run locally
+        "app/settings/production.py": 'import os\nDSN = os.environ["SENTRY_DSN"]\n',
+        # other languages: reads count for documentation only, and never fail a machine check
+        "lib/app.rb": 'url = ENV["QUEUE_URL"]\nport = ENV.fetch("WEB_PORT", 3000)\n',
+        "cmd/main.go": 'token := os.Getenv("GO_TOKEN")\n',
+    }
+    found = rd.scan_env(repo(files))
+    hard = sorted(v for v, (_, is_hard) in found.items() if is_hard)
+    assert hard == ["API_KEY", "API_TOKEN", "APP_DATABASE_URL", "DATABASE_URL", "DJANGO_SECRET_KEY", "LONG_ONE",
+                    "MONGODB_URL", "REDIS_URL", "STRIPE_KEY"], hard
+    soft = sorted(v for v, (_, is_hard) in found.items() if not is_hard)
+    assert soft == ["GO_TOKEN", "QUEUE_URL", "SENTRY_DSN"], soft
+    assert found["MONGODB_URL"][0] == "src/config.js:4"
+
+    machine()
+    checks = rd.diagnose(repo({"main.go": 'token := os.Getenv("GO_TOKEN")\n', "go.mod": "module x\n"}), env={})
+    assert not messages(checks, FAIL) or all("GO_TOKEN" not in m for m in messages(checks, FAIL))
 
 
 def test_ask_reads_from_the_terminal():
