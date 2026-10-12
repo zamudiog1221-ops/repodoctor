@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Read a repo's setup requirements from its code and check them against your machine."
 readme = "README.md"
 requires-python = ">=3.8"
+license = {text = "MIT"}
 
 [project.scripts]
 repodoctor = "repodoctor:main"
