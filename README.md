@@ -25,8 +25,6 @@ setupdoctor: 5 checks
 4 failed, 0 warning(s), 1 passed
 ```
 
-That is real output from a fresh clone of `hagopj13/node-express-boilerplate`.
-
 ## Install
 
 ```
@@ -118,6 +116,16 @@ Softer reads such as `os.getenv("X")` or a bare `process.env.X` are treated as s
 - Compose files are read by pattern, so ports written as `${VAR:-5432}:5432` are missed.
 - A missing Python virtualenv is a warning, because poetry and pipenv keep theirs outside the repo.
 - Anything that lives outside the code, such as VPN access or an account someone has to create for you, cannot be detected.
+
+## Related tools
+
+If a project already ships a Dev Container, a Nix flake or a `mise` config, use that: it sets the environment up for you. setupdoctor is for the projects that don't, which is most of them, and it needs nothing added to the repo.
+
+`npm doctor` checks your npm installation, not a particular project. A few small tools check some of the same things setupdoctor does, such as [env-doctor](https://github.com/thehypewipe/env-doctor) and [forkready](https://github.com/AmarReddy4/repo-scout).
+
+## False alarms
+
+A wrong result is the worst thing this tool can do. It has been run against 21 open-source projects and tuned until every failure it reported was real, but that is a small sample. If it reports something that isn't a problem, or misses something that is, please open an issue naming the repo.
 
 ## Tests
 
