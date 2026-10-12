@@ -515,8 +515,8 @@ def clone_hook(install):
     if hook.exists() and not ours:
         return 1, f"{hook} already exists and isn't setupdoctor's, so it was left alone."
     hook.parent.mkdir(parents=True, exist_ok=True)
-    hook.write_text(HOOK.format(python=Path(sys.executable).as_posix(), script=Path(__file__).resolve().as_posix()),
-                    encoding="utf-8", newline="\n")
+    with open(hook, "w", encoding="utf-8", newline="\n") as f:  # sh needs \n line endings, on Windows too
+        f.write(HOOK.format(python=Path(sys.executable).as_posix(), script=Path(__file__).resolve().as_posix()))
     hook.chmod(0o755)
     git_global("init.templateDir", template.as_posix())
     return 0, ("Installed. Every `git clone` from now on runs setupdoctor in the new folder.\n"

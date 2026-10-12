@@ -1,5 +1,6 @@
 """Run with: python test_setupdoctor.py"""
 import contextlib
+import faulthandler
 import io
 import os
 import shutil
@@ -315,10 +316,21 @@ def test_ask_reads_from_the_terminal():
     pid, terminal = pty.fork()
     if pid == 0:  # child: its controlling terminal is the pseudo-terminal
         os._exit(0 if rd.ask("Run them now? [y/N] ") == "y" else 1)
+    def read():
+        try:
+            return os.read(terminal, 1024)
+        except OSError:  # Linux reports the child closing the terminal as an error; macOS as end of file
+            return b""
+
     seen = b""
     while b"[y/N]" not in seen:
-        seen += os.read(terminal, 1024)
+        chunk = read()
+        if not chunk:
+            break
+        seen += chunk
     os.write(terminal, b"y\n")
+    while read():  # drain the echo: macOS won't let the child exit while its output is unread
+        pass
     assert os.waitpid(pid, 0)[1] == 0, seen
 
 
@@ -358,6 +370,7 @@ def test_real_docker():
 
 
 if __name__ == "__main__":
+    faulthandler.dump_traceback_later(300, exit=True)  # a hung test should say where it hung, not sit there
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
             fn()
