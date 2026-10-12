@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "setupdoctor"
-version = "0.2.1"
+version = "0.2.2"
 description = "Read a repo's setup requirements from its code and check them against your machine."
 readme = "README.md"
 requires-python = ">=3.9"

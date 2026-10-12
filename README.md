@@ -1,5 +1,7 @@
 # setupdoctor
 
+[![tests](https://github.com/zamudiog1221-ops/setupdoctor/actions/workflows/tests.yml/badge.svg)](https://github.com/zamudiog1221-ops/setupdoctor/actions/workflows/tests.yml)
+
 `brew doctor` for any repo. It reads what a project needs from its code and config files, checks your machine, and prints the fix for each gap. It never reads the README.
 
 ![setupdoctor running after git clone: one check passes, four fail with their fixes, then it offers to run them](https://raw.githubusercontent.com/zamudiog1221-ops/setupdoctor/main/demo.svg)
@@ -31,7 +33,7 @@ That is real output from a fresh clone of `hagopj13/node-express-boilerplate`.
 pip install setupdoctor
 ```
 
-It needs Python 3.9 or newer and has no dependencies.
+It needs Python 3.9 or newer and has no dependencies. The tests run on Linux, macOS and Windows on every push.
 
 ## Use
 
