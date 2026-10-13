@@ -27,8 +27,11 @@ MARK = {OK: ("✓", "32"), FAIL: ("✗", "31"), WARN: ("!", "33")}
 SKIP_DIRS = {"node_modules", "venv", "env", "dist", "build", "out", "target", "vendor", "coverage", "obj",
              "__pycache__", "site-packages", "test", "tests", "__tests__", "e2e", "docs", "examples",
              "fixtures", "samples", "sample", "demo", "demos", "benchmarks", "third_party"}
+# Also skipped: folders named like api-e2e or integration_tests, and template folders such as
+# cookiecutter's {{cookiecutter.project_slug}}, whose contents aren't a project until rendered.
+SKIP_DIR_LIKE = re.compile(r"(?i)(^|[-_.])(e2e|tests?|specs?|examples?|fixtures?|benchmarks?|demos?|samples?)($|[-_.])|\{\{|\{%")
 SKIP_FILE = re.compile(r"(^test_|^conftest\.|_test\.|_spec\.|\.test\.|\.spec\.|\.min\.|"
-                       r"^(playwright|jest|vitest|cypress)\.config\.)")
+                       r"^(playwright|jest|vitest|cypress|karma)\.config\.|^wdio\.)")
 # Settings that only apply to a deployed copy; what they read is never needed to run the project locally.
 DEPLOY_FILE = re.compile(r"(?i)(^|[/_.\-])(prod|production|staging|deploy|deployment)([/_.\-]|$)")
 JS_EXT = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
@@ -67,7 +70,10 @@ OTHER_ENV = {ext: [re.compile(rx) for rx in patterns] for ext, patterns in {
 }.items()}
 
 ENV_FILES = [".env", ".env.local", ".env.development", ".env.development.local"]
-ENV_EXAMPLES = [".env.example", ".env.sample", ".env.template", ".env.dist"]
+# Example file -> the file you are meant to copy it to.
+EXAMPLE_TARGET = {".env.example": ".env", ".env.sample": ".env", ".env.template": ".env", ".env.dist": ".env",
+                  ".env.local.example": ".env.local", "example.env": ".env", "env.example": ".env"}
+ENV_EXAMPLES = list(EXAMPLE_TARGET)
 
 NODE_LOCKS = [("pnpm-lock.yaml", "pnpm"), ("yarn.lock", "yarn"), ("bun.lockb", "bun"), ("bun.lock", "bun")]
 NODE_OWN_LOCKS = [name for name, _ in NODE_LOCKS] + ["package-lock.json"]
@@ -83,6 +89,7 @@ COPY = "copy"  # built-in action: [COPY, source, destination], done in Python
 IN = "in"      # wrapper: [IN, folder, *command] runs the command inside that sub-project folder
 VENV_PYTHON = ".venv/Scripts/python.exe" if os.name == "nt" else ".venv/bin/python"
 MAX_SUBPROJECTS = 12
+SCAN_SECONDS = 8  # how long the interactive check may spend reading source files
 
 SERVICES = {5432: "Postgres", 6379: "Redis", 27017: "MongoDB", 3306: "MySQL"}
 # ponytail: pattern match, not a YAML parser; misses ports written as ${VAR:-5432}:5432. Parse YAML if that bites.
@@ -95,6 +102,10 @@ TOOL_CMDS = {"nodejs": "node", "node": "node", "python": "python", "ruby": "ruby
 TOOL_LABEL = {"node": "Node", "python": "Python", "ruby": "Ruby", "go": "Go", "java": "Java", "rustc": "Rust",
               "php": "PHP", "terraform": "Terraform", "deno": "Deno", "bun": "Bun", "dotnet": ".NET"}
 VERSION_ARGS = {"go": ["version"], "java": ["-version"]}
+
+
+def skip_dir(name):
+    return name in SKIP_DIRS or name.startswith(".") or bool(SKIP_DIR_LIKE.search(name))
 
 
 def read(path):
@@ -120,6 +131,11 @@ def load_json(path):
 def version(text):
     m = re.search(r"\d+(?:\.\d+)*", text or "")
     return tuple(int(p) for p in m.group().split(".")) if m else None
+
+
+def newest(spec):
+    """The highest version a spec mentions: for "^7.4 || ^8.0" the one worth installing is 8.0."""
+    return max(v for v in map(version, spec.split("||")) if v)
 
 
 def satisfies(found, spec, n):
@@ -324,7 +340,11 @@ def py_env_uses(text):
         guarded = guarded or isinstance(node, (ast.If, ast.IfExp, ast.Try))
         is_or = isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or)
         stack.extend((child, guarded, is_or) for child in ast.iter_child_nodes(node))
-    return sorted(uses, key=lambda use: use[1])
+    # os.environ.setdefault("X", ...) anywhere in the file gives X a default
+    defaulted = {text_of(node.args[0]) for node in ast.walk(tree) if isinstance(node, ast.Call) and node.args
+                 and isinstance(node.func, ast.Attribute) and node.func.attr == "setdefault" and is_environ(node.func.value)}
+    return sorted(((name, line, optional or name in defaulted, hard) for name, line, optional, hard in uses),
+                  key=lambda use: use[1])
 
 
 def other_env_uses(text, patterns):
@@ -337,13 +357,17 @@ def other_env_uses(text, patterns):
                 yield m.group(1), n, bool(m.lastindex and m.lastindex > 1), False
 
 
-def scan_env(root, exclude=()):
+def scan_env(root, exclude=(), budget=None):
     """Map each env var the source reads without a fallback to ('file:line' of first use, hard).
-    `exclude` holds folders that are projects of their own and get scanned separately."""
+    `exclude` holds folders that are projects of their own and get scanned separately. `budget` is
+    {"until": time, "hit": False}: reading thousands of files can take a minute on a machine whose
+    virus scanner checks each one, and a check that runs after every clone must not do that."""
     reads, exclude = {}, {str(p) for p in exclude}
     for dirpath, dirs, files in os.walk(root):
-        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")
-                         and os.path.join(dirpath, d) not in exclude)
+        if budget and time.monotonic() > budget["until"]:
+            budget["hit"] = True
+            break
+        dirs[:] = sorted(d for d in dirs if not skip_dir(d) and os.path.join(dirpath, d) not in exclude)
         for name in sorted(files):
             ext = os.path.splitext(name)[1]
             if not (ext in JS_EXT or ext == ".py" or ext in OTHER_ENV) or SKIP_FILE.search(name):
@@ -391,7 +415,8 @@ def pinned_tools(root):
 
 
 def check_version(label, found, spec, source, n, fix):
-    need = f"{label} {spec} required ({source})"
+    shown_spec = re.sub(r"^[A-Za-z][A-Za-z-]*(?=\d)", "", spec.strip())  # "python-3.12.4" and "v20.11.0" read better bare
+    need = f"{label} {shown_spec} required ({source})"
     if not found:
         return FAIL, f"{need}, but no working {label} was found", fix
     shown = ".".join(map(str, found))
@@ -469,7 +494,7 @@ LANGS = [
     {"name": "PHP", "files": ("composer.json",), "cmd": "php", "pin": 2, "specs": php_specs,
      "get": "install PHP{v} (https://www.php.net/downloads)",
      "tools": lambda root: [("composer", "composer.json", "install Composer (https://getcomposer.org)")],
-     "deps": ("vendor", ["composer", "install"])},
+     "deps": ("vendor/autoload.php", ["composer", "install"])},  # composer always writes this file
     {"name": "Ruby", "files": ("Gemfile",), "cmd": "ruby", "pin": 2, "specs": ruby_specs,
      "get": "install Ruby{v} (for example: rbenv install{v})",
      "tools": lambda root: [("bundle", "Gemfile", "gem install bundler")]},
@@ -503,18 +528,25 @@ def langs_in(folder):
     return found
 
 
+def has_example(folder):
+    return any((folder / name).exists() for name in ENV_EXAMPLES)
+
+
 def find_subprojects(root):
-    """Sub-folders, up to two levels down, that hold a project of their own."""
+    """Sub-folders, up to two levels down, that hold a project or an env example file of their own."""
     def folders(parent):
         try:
-            return sorted(p for p in parent.iterdir() if p.is_dir() and p.name not in SKIP_DIRS and not p.name.startswith("."))
+            return sorted(p for p in parent.iterdir() if p.is_dir() and not skip_dir(p.name))
         except OSError:
             return []
 
+    def counts(folder):
+        return bool(langs_in(folder)) or has_example(folder)
+
     found = []
     for one in folders(root):
-        found += [one] if langs_in(one) else []
-        found += [two for two in folders(one) if langs_in(two)]
+        found += [one] if counts(one) else []
+        found += [two for two in folders(one) if counts(two)]
     return found
 
 
@@ -528,7 +560,7 @@ def check_node(root, pins, add):
     node_ok = bool(node)
     for source, spec in specs:
         if version(spec):
-            check = check_version("Node", node, spec, source, 1, f"nvm install {version(spec)[0]}")
+            check = check_version("Node", node, spec, source, 1, f"nvm install {newest(spec)[0]}")
             node_ok = check[0] == OK
             add(*check)
             break
@@ -571,7 +603,7 @@ def check_python(root, pins, env, add):
         python = run_version("python", "python3", cwd=root) or tuple(sys.version_info[:3])
         for source, spec in specs:
             if version(spec):
-                want = ".".join(map(str, version(spec)[:2]))
+                want = ".".join(map(str, newest(spec)[:2]))
                 check = check_version("Python", python, spec, source, 2,
                                       f"install Python {want} (for example: pyenv install {want})")
                 py_ok = check[0] == OK
@@ -612,7 +644,7 @@ def check_simple(lang, root, pins, add):
         ok = bool(found)
         if specs:
             source, spec = specs[0]
-            want = ".".join(map(str, version(spec)[:2]))
+            want = ".".join(map(str, newest(spec)[:2]))
             newer = lang.get("self_updating_from")
             if found and newer and found >= newer and not satisfies(found, spec, lang["pin"]):
                 add(OK, f"{name} {spec} required ({source}), found {'.'.join(map(str, found))}, "
@@ -629,16 +661,16 @@ def check_simple(lang, root, pins, add):
             missing_tool = True
             add(FAIL, f"{tool} is needed ({why}) but is not installed", how)
     if lang.get("deps"):
-        folder, install = lang["deps"]
-        if (root / folder).is_dir():
-            add(OK, f"{name} dependencies installed ({folder} exists)")
+        proof, install = lang["deps"]
+        if (root / proof).exists():
+            add(OK, f"{name} dependencies installed ({proof} exists)")
         else:
-            add(FAIL, f"{name} dependencies not installed (no {folder} folder)",
+            add(FAIL, f"{name} dependencies not installed (no {proof})",
                 " ".join(install) + ("" if ok else f" (after fixing the {name} version)"),
                 [install] if ok and not missing_tool else None)
 
 
-def diagnose_dir(root, ci, env, port_wait, langs, exclude=(), parent=None):
+def diagnose_dir(root, ci, env, port_wait, langs, exclude=(), parent=None, budget=None):
     """The checks for one project folder. `parent` is the repo root when this is a sub-project: its
     env files count too, because a monorepo often keeps one .env at the top."""
     checks = []
@@ -647,7 +679,7 @@ def diagnose_dir(root, ci, env, port_wait, langs, exclude=(), parent=None):
         checks.append((status, message, fix, run))
 
     shared = [parent] if parent else []
-    reads = scan_env(root, exclude)
+    reads = scan_env(root, exclude, budget)
     example = next((n for n in ENV_EXAMPLES if (root / n).exists()), None)
     documented = set().union(*(env_keys(folder, ENV_EXAMPLES, commented=True) for folder in [root] + shared))
     undocumented = sorted(v for v in reads if v not in documented)
@@ -682,19 +714,17 @@ def diagnose_dir(root, ci, env, port_wait, langs, exclude=(), parent=None):
     # .env.example is a declared requirement even when the code reads env vars in a way the scan can't see.
     declared_unset = sorted(k for k in env_keys(root, ENV_EXAMPLES) if k not in env and k not in set_keys)
     if declared_unset and not any((root / n).exists() for n in ENV_FILES):
-        add(FAIL, f"No .env file; {example} defines {len(declared_unset)} variable(s)",
-            f"cp {example} .env, then fill in the values", [[COPY, example, ".env"]])
+        target = EXAMPLE_TARGET[example]
+        add(FAIL, f"No {target} file; {example} defines {len(declared_unset)} variable(s)",
+            f"cp {example} {target}, then fill in the values", [[COPY, example, target]])
         missing = [v for v in missing if v not in documented]
     elif set(declared_unset) - set(missing):
         add(WARN, f"In {example} but not in your .env: " + ", ".join(sorted(set(declared_unset) - set(missing))),
             f"copy them over from {example} if you need them")
     for var in missing:
         add(FAIL, f"{var} is not set (first used in {reads[var][0]})", f"add {var}=... to .env")
-    # Only worth a line when the repo keeps an example file and it has fallen behind the code.
-    if undocumented and example:
-        shown = ", ".join(undocumented[:5]) + (f" and {len(undocumented) - 5} more" if len(undocumented) > 5 else "")
-        add(WARN, f"{len(undocumented)} variable(s) the code reads are missing from {example}: {shown}",
-            "setupdoctor --ci lists each one with its location")
+    # Undocumented-but-optional variables are the maintainers' business, not the person who just
+    # cloned the repo: that list is what --ci is for.
 
     declared = {}
     compose = next((n for n in ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml")
@@ -724,20 +754,27 @@ def diagnose(root, ci=False, env=os.environ, port_wait=0):
     root = Path(root)
     top = langs_in(root)
     # A sub-folder in a language the top folder also uses is a member of that project (a workspace
-    # package), installed from the top. A Node folder with its own lockfile is the exception.
+    # package), installed from the top. A Node folder with its own lockfile is the exception. A member
+    # that has its own .env.example still gets its env checks done in its own folder.
     subs = [(sub, langs) for sub in find_subprojects(root)
             for langs in [{name for name in langs_in(sub) if name not in top
-                           or (name == "Node" and any((sub / lock).exists() for lock in NODE_OWN_LOCKS))}] if langs]
+                           or (name == "Node" and any((sub / lock).exists() for lock in NODE_OWN_LOCKS))}]
+            if langs or has_example(sub)]
     unchecked, subs = len(subs) - MAX_SUBPROJECTS, subs[:MAX_SUBPROJECTS]
     folders = [sub for sub, _ in subs]
-    checks = diagnose_dir(root, ci, env, port_wait, top, exclude=folders)
+    # --ci has to be complete, so only the interactive check gets a time limit on reading source files
+    budget = None if ci else {"until": time.monotonic() + SCAN_SECONDS, "hit": False}
+    checks = diagnose_dir(root, ci, env, port_wait, top, exclude=folders, budget=budget)
     for sub, langs in subs:
         label = sub.relative_to(root).as_posix()
-        for status, message, fix, run in diagnose_dir(sub, ci, env, port_wait, langs, parent=root,
+        for status, message, fix, run in diagnose_dir(sub, ci, env, port_wait, langs, parent=root, budget=budget,
                                                       exclude=[other for other in folders if sub in other.parents]):
             checks.append((status, f"[{label}] {message}", fix, run and [[IN, label, *cmd] for cmd in run]))
     if unchecked > 0:
         checks.append((WARN, f"{unchecked} more project folder(s) were not checked", "run setupdoctor inside them", None))
+    if budget and budget["hit"]:
+        checks.append((WARN, f"Stopped reading source files after {SCAN_SECONDS} seconds, so a required "
+                             f"environment variable could have been missed", "setupdoctor --ci reads everything", None))
     return checks
 
 

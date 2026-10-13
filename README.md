@@ -4,6 +4,8 @@
 
 `brew doctor` for any repo. It reads what a project needs from its code and config files, checks your machine, and prints the fix for each gap. It never reads the README.
 
+Works with Node, Python, PHP, Ruby, Go, Rust, Java and .NET projects, including monorepos.
+
 ![setupdoctor running after git clone: one check passes, four fail with their fixes, then it offers to run them](https://raw.githubusercontent.com/zamudiog1221-ops/setupdoctor/main/demo.svg)
 
 The animation re-creates setupdoctor's real output for `hagopj13/node-express-boilerplate`. The same checklist as text:
@@ -58,15 +60,15 @@ Run them now? [y/N]
 
 Answer `y` and it runs them in order, stops at the first one that fails, then checks again. Anything else, including just pressing Enter, changes nothing. It never asks in CI, with `--ci`, or when the output is going to a file.
 
-What it can run: installing the package manager, installing dependencies, creating a Python virtualenv, copying `.env.example` to `.env` (never over an existing file), and `docker compose up -d`.
+What it can run: installing a Node or Python package manager, installing Node, Python or PHP dependencies, creating a Python virtualenv, copying `.env.example` to `.env` (never over an existing file), and `docker compose up -d`.
 
 If npm's global folder is not on your PATH, which is common on Windows machines set up without admin rights, `npm install -g yarn` succeeds but `yarn` is still not found. setupdoctor detects that, runs yarn from that folder itself, and tells you which folder to add to your PATH.
 
 What it leaves to you:
 
-- A wrong Node or Python version. Version managers work by changing your terminal session, which a program can't do for you. Dependencies are not installed until the version is right.
+- A wrong language version. Version managers work by changing your terminal session, which a program can't do for you. Dependencies are not installed until the version is right.
 - Secret values. It creates `.env`, but only you know what goes in it.
-- Installing Node or Docker themselves.
+- Installing a language runtime or Docker themselves.
 
 The commands come from a fixed list inside setupdoctor, never from text in the repo. Installing a project's dependencies does run that project's own install scripts, as `npm install` always does, so answer `n` for a repo you don't trust.
 
@@ -84,34 +86,57 @@ This is the one command that changes your machine: it adds a `post-checkout` hoo
 
 ## What it checks
 
-| Check | Read from |
-|---|---|
-| Node version | `.nvmrc`, `.node-version`, `package.json` engines |
-| Python version | `.python-version`, `runtime.txt`, `pyproject.toml` |
-| Package manager is installed | lockfile or `packageManager` (pnpm, yarn, bun, uv, poetry, pipenv) |
-| Dependencies are installed | `node_modules`; `.venv` or `venv` |
-| Env vars are set | `.env.example`, plus reads in the source that break when the variable is unset |
-| Env vars are documented | every env var the source reads, compared with `.env.example` |
-| Services are running | Postgres, Redis, MongoDB and MySQL ports in the compose file |
+| Language | Version read from | Also checks | Can install |
+|---|---|---|---|
+| Node | `.nvmrc`, `.node-version`, `package.json` engines | package manager (npm, yarn, pnpm, bun), `node_modules` | package manager, dependencies |
+| Python | `.python-version`, `runtime.txt`, `pyproject.toml` | package manager (uv, poetry, pipenv), virtualenv | package manager, virtualenv and dependencies |
+| PHP | `composer.json` | composer, `vendor/autoload.php` | dependencies |
+| Ruby | `.ruby-version`, `Gemfile` | bundler | |
+| Go | `go.mod` | | |
+| Rust | `rust-toolchain`, `Cargo.toml` | cargo | |
+| Java | `.java-version`, `.sdkmanrc`, `pom.xml`, `build.gradle` | Maven or Gradle, unless the repo ships its wrapper | |
+| .NET | `global.json`, the project file | | |
+
+For every language it also checks:
+
+- **Pinned tools.** Anything listed in `.tool-versions` or `mise.toml` (asdf and mise), including tools outside the table such as Terraform, Deno and Bun.
+- **Env files.** `.env.example` and its variants (`.env.sample`, `.env.local.example`, `example.env` and others) against your `.env`.
+- **Services.** Postgres, Redis, MongoDB and MySQL ports published in the compose file.
+
+Go, Rust, Java and .NET fetch dependencies when you build, so there is nothing to check or install. Ruby's gems can only be checked by running bundler, which executes the project's `Gemfile`, and setupdoctor never runs a repo's code to check it.
+
+### Monorepos
+
+It looks for projects in the top folder and up to two levels below it, and labels each one:
+
+```
+  ✗ [backend] Python 3.12 required (.python-version), found 3.10.4
+  ✗ [frontend] Node dependencies not installed (no node_modules folder)
+```
+
+Fixes run inside the folder they belong to. Workspace packages (a sub-folder in the same language as the top folder) are installed from the top, so they are not checked one by one, unless the folder has its own lockfile. A sub-folder with its own `.env.example` gets its env check there.
+
+### Required environment variables
 
 It only fails a check when the repo declares the requirement. For environment variables that means one of:
 
 - the variable is in `.env.example` and you have no `.env`
-- Python reads it as `os.environ["X"]` outside any `if` or `try`
-- TypeScript reads it as `process.env.X!`
+- a settings schema marks it required: zod (including t3-env), envalid or Joi in JavaScript; pydantic-settings, django-environ or python-decouple in Python
+- the code stops without it: `if (!process.env.X) throw ...`, TypeScript's `process.env.X!`, or Python's `os.environ["X"]` outside any `if` or `try`
 
-Softer reads such as `os.getenv("X")` or a bare `process.env.X` are treated as settings the app can run without. On real projects they nearly always are, and reporting them buried the real problems under dozens of false alarms. Tests, docs, examples and installed packages are not scanned.
+Softer reads such as `os.getenv("X")` or a bare `process.env.X` are treated as settings the app can run without. On real projects they nearly always are, and reporting them buried the real problems under dozens of false alarms. Tests, docs, examples, deployment-only settings files and installed packages are not scanned.
 
 ## CI mode
 
-`setupdoctor --ci` ignores the machine and fails if the code reads an environment variable that is not in `.env.example`. Run it on every pull request and the example file cannot fall behind the code.
+`setupdoctor --ci` ignores the machine and fails if the code reads an environment variable that is not in `.env.example`. Run it on every pull request and the example file cannot fall behind the code. It reads env vars in all eight languages plus Kotlin.
 
 ## Limits
 
-- Node and Python only.
-- It checks the folder you point it at. In a monorepo, run it in each project folder.
-- Env var names built at runtime, or read through a settings library (Joi, pydantic-settings, django-environ), are not seen by the scan. The `.env.example` check still covers them.
-- A JavaScript project with no `.env.example` gets no env var checks, because nothing in plain JavaScript marks a variable as required.
+- Node and Python get the full treatment. The other six languages get version and tooling checks, and only PHP gets a dependency check.
+- Projects nested more than two folders deep are not found. At most 12 sub-projects are checked.
+- Env var names built at runtime are not seen. A JavaScript project with no `.env.example`, no settings schema and no guard clause gets no env var checks.
+- On the interactive check, reading source files stops after 8 seconds and says so. On a huge repo, or a machine whose virus scanner checks every file, that can cut the env var scan short. `--ci` always reads everything.
+- A compose file's databases are assumed to be needed. If the project treats them as optional, you get a failure you can ignore.
 - A database is only checked if the compose file publishes its port. One you are expected to install yourself is not detected.
 - Compose files are read by pattern, so ports written as `${VAR:-5432}:5432` are missed.
 - A missing Python virtualenv is a warning, because poetry and pipenv keep theirs outside the repo.
@@ -125,7 +150,7 @@ If a project already ships a Dev Container, a Nix flake or a `mise` config, use 
 
 ## False alarms
 
-A wrong result is the worst thing this tool can do. It has been run against 21 open-source projects and tuned until every failure it reported was real, but that is a small sample. If it reports something that isn't a problem, or misses something that is, please open an issue naming the repo.
+A wrong result is the worst thing this tool can do. It has been run against 78 open-source projects across the eight languages and tuned until every failure it reported was one the repo declares, but that is still a small sample. If it reports something that isn't a problem, or misses something that is, please open an issue naming the repo.
 
 ## Tests
 

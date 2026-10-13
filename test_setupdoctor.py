@@ -140,13 +140,11 @@ def test_env_checks():
     # reads that cope with an unset variable are never failures
     assert not any(s == FAIL and v in msg for s, msg, *_ in checks
                    for v in ("STRIPE_KEY", "SESSION_SECRET", "S3_BUCKET", "CF_EMAIL"))
-    assert has(checks, WARN, "5 variable(s) the code reads are missing from .env.example: CF_EMAIL, DATABASE_URL")
+    # optional variables missing from .env.example are for --ci to report, not for someone who just cloned
+    assert not messages(checks, WARN), checks
 
     (root / ".env").write_text("STRIPE_KEY=a\nDATABASE_URL=b\nJWT_SECRET=c\n")
     assert has(rd.diagnose(root, env={}), OK, "All 2 required environment variables are set")
-
-    # no example file: nothing to fall behind, so no warning about undocumented variables
-    assert not has(rd.diagnose(repo(ENV_FILES), env={}), WARN, "missing from")
 
     # code that reads env vars in a way the scan can't see still gets the .env.example check
     root = repo({"package.json": "{}", ".env.example": "JWT_SECRET=\nMONGODB_URL=\n"})
@@ -322,7 +320,9 @@ def test_other_languages():
     machine(php=(8, 2, 1), tools=("composer",))
     root = repo(php)
     assert [(s, run) for s, _, _, run in rd.diagnose(root, env={})] == [(OK, None), (FAIL, [["composer", "install"]])]
-    (root / "vendor").mkdir()
+    (root / "vendor").mkdir()  # an empty or placeholder vendor folder doesn't count
+    assert [s for s, *_ in rd.diagnose(root, env={})] == [OK, FAIL]
+    (root / "vendor" / "autoload.php").write_text("<?php")
     assert [s for s, *_ in rd.diagnose(root, env={})] == [OK, OK]
     machine(php=(8, 2, 1))
     assert has(rd.diagnose(root, env={}), FAIL, "composer is needed (composer.json) but is not installed")
@@ -331,7 +331,7 @@ def test_other_languages():
     machine(ruby=(3, 3, 5), tools=("bundle",))
     assert [s for s, *_ in rd.diagnose(repo(ruby), env={})] == [OK]
     machine(ruby=(3, 1, 0), tools=("bundle",))
-    assert has(rd.diagnose(repo(ruby), env={}), FAIL, "Ruby ruby-3.3.0 required (.ruby-version), found 3.1.0")
+    assert has(rd.diagnose(repo(ruby), env={}), FAIL, "Ruby 3.3.0 required (.ruby-version), found 3.1.0")
 
     go = {"go.mod": "module example.com/x\n\ngo 1.23\n"}
     machine(go=(1, 19, 0))
@@ -480,6 +480,45 @@ def test_env_schemas():
     machine()
     checks = rd.diagnose(repo({"main.go": 'token := os.Getenv("GO_TOKEN")\n', "go.mod": "module x\n"}), env={})
     assert not messages(checks, FAIL) or all("GO_TOKEN" not in m for m in messages(checks, FAIL))
+
+    # found on real repos: a setdefault makes the read safe, and e2e and template folders aren't the app
+    quiet = {"settings.py": "from os import environ\nenviron.setdefault('DJANGO_ENV', 'development')\nENV = environ['DJANGO_ENV']\n",
+             "packages/api-e2e/wdio.conf.ts": "const key = process.env.CN_API_KEY!;",
+             "{{cookiecutter.project_slug}}/config.py": 'import os\nx = os.environ["TEMPLATE_ONLY"]\n',
+             "{{cookiecutter.project_slug}}/package.json": '{"dependencies": {"x": "1"}}'}
+    assert rd.scan_env(repo(quiet)) == {} and rd.diagnose(repo(quiet), env={}) == []
+
+
+def test_scan_time_limit():
+    """A slow disk must not turn the after-clone check into a minute-long wait."""
+    machine()
+    root = repo({"a/one.py": 'import os\nx = os.environ["NEEDED"]\n'})
+    real, rd.SCAN_SECONDS = rd.SCAN_SECONDS, -1  # already out of time
+    try:
+        checks = rd.diagnose(root, env={})
+        assert messages(checks, WARN) == ["Stopped reading source files after -1 seconds, so a required "
+                                          "environment variable could have been missed"]
+        assert rd.diagnose(root, ci=True, env={})[0][0] == FAIL  # --ci is never cut short
+    finally:
+        rd.SCAN_SECONDS = real
+
+
+def test_env_example_variants():
+    """Next.js projects ship .env.local.example, and workspace packages often have their own example."""
+    machine(node=(20, 0, 0), tools=("npm",))
+    root = repo({"package.json": "{}", ".env.local.example": "SUPABASE_URL=\n", "app/db.ts": "const u = process.env.SUPABASE_URL!;"})
+    (check,) = rd.diagnose(root, env={})
+    assert check[1:] == ("No .env.local file; .env.local.example defines 1 variable(s)",
+                         "cp .env.local.example .env.local, then fill in the values",
+                         [[rd.COPY, ".env.local.example", ".env.local"]]), check
+
+    # apps/live is a workspace member (no checks of its own for Node), but its env example is its own
+    files = {"package.json": '{"workspaces": ["apps/*"]}', "apps/live/package.json": "{}",
+             "apps/live/.env.example": "LIVE_SECRET=\n",
+             "apps/live/src/env.ts": 'import { z } from "zod";\nconst s = z.object({\n  LIVE_SECRET: z.string(),\n});\ns.parse(process.env);\n'}
+    checks = rd.diagnose(repo(files), env={})
+    assert [(msg, run) for _, msg, _, run in checks] == [
+        ("[apps/live] No .env file; .env.example defines 1 variable(s)", [[rd.IN, "apps/live", rd.COPY, ".env.example", ".env"]])]
 
 
 def test_ask_reads_from_the_terminal():
